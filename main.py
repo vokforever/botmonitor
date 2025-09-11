@@ -15,6 +15,7 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
 from aiogram.types import Message
 from dotenv import load_dotenv
+from supabase import create_client, Client
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -32,6 +33,16 @@ ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
 if not ADMIN_CHAT_ID:
     raise ValueError("ADMIN_CHAT_ID не найден в переменных окружения. Создайте .env файл с ADMIN_CHAT_ID=your_chat_id")
 
+SUPABASE_URL = os.getenv('SUPABASE_URL')
+SUPABASE_KEY = os.getenv('SUPABASE_KEY')
+if not SUPABASE_URL or not SUPABASE_KEY:
+    raise ValueError("SUPABASE_URL и SUPABASE_KEY не найдены в переменных окружения")
+
+supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
+
+from io import BytesIO
+from playwright.async_api import async_playwright
+
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -41,16 +52,120 @@ CHECK_INTERVAL = 300  # 5 минут
 SSL_WARNING_DAYS = 30  # Предупреждение о сроке истечения SSL сертификата (в днях)
 
 
-def update_db():
-    conn = sqlite3.connect('sites_monitor.db')
-    cursor = conn.cursor()
+
+
+async def is_admin_in_chat(chat_id: int, user_id: int) -> bool:
     try:
-        cursor.execute('ALTER TABLE sites ADD COLUMN original_url TEXT')
-        conn.commit()
-    except sqlite3.OperationalError:
-        # Column might already exist
-        pass
-    conn.close()
+        chat_member = await bot.get_chat_member(chat_id, user_id)
+        return chat_member.status in ['administrator', 'creator']
+    except Exception as e:
+        logging.error(f"Error checking admin status: {e}")
+        return False
+
+
+async def migrate_from_sqlite():
+    """Переносит данные из SQLite в Supabase и удаляет SQLite базу"""
+    sqlite_db_path = 'sites_monitor.db'
+    
+    # Проверяем существование SQLite базы
+    if not os.path.exists(sqlite_db_path):
+        logging.info("SQLite база данных не найдена. Миграция не требуется.")
+        return
+        
+    try:
+        # Подключаемся к SQLite
+        conn = sqlite3.connect(sqlite_db_path)
+        cursor = conn.cursor()
+        
+        # Проверяем структуру таблицы SQLite
+        cursor.execute("PRAGMA table_info(sites)")
+        columns_info = cursor.fetchall()
+        column_names = [col[1] for col in columns_info]
+        
+        # Формируем SELECT запрос в зависимости от структуры таблицы
+        if 'original_url' in column_names:
+            select_query = """
+                SELECT url, original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check 
+                FROM sites
+            """
+        else:
+            select_query = """
+                SELECT url, NULL as original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check 
+                FROM sites
+            """
+        
+        cursor.execute(select_query)
+        sites = cursor.fetchall()
+        conn.close()
+        
+        if not sites:
+            logging.info("Нет данных для миграции.")
+            os.remove(sqlite_db_path)
+            logging.info("Пустая SQLite база удалена.")
+            return
+            
+        # Переносим данные в Supabase
+        migrated_count = 0
+        for site_data in sites:
+            url, original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check = site_data
+            
+            try:
+                # Проверяем, не существует ли уже такая запись в Supabase
+                existing = supabase.table('botmonitor_sites').select('id').eq('url', url).eq('chat_id', user_id).execute()
+                
+                if existing.data:
+                    logging.info(f"Сайт {url} для chat_id {user_id} уже существует в Supabase")
+                    continue
+                
+                # Подготавливаем данные для вставки
+                insert_data = {
+                    'url': url,
+                    'original_url': original_url,
+                    'user_id': user_id,
+                    'chat_id': user_id,  # Для старых записей chat_id = user_id (приватные чаты)
+                    'chat_type': 'private',  # Старые записи были из приватных чатов
+                    'is_up': bool(is_up) if is_up is not None else True,
+                    'has_ssl': bool(has_ssl) if has_ssl is not None else False,
+                    'ssl_expires_at': ssl_expires_at if ssl_expires_at else None,
+                    'last_check': last_check if last_check else None
+                }
+                
+                # Добавляем запись в Supabase
+                result = supabase.table('botmonitor_sites').insert(insert_data).execute()
+                
+                if result.data:
+                    migrated_count += 1
+                    logging.info(f"Перенесен сайт: {url}")
+                
+            except Exception as e:
+                logging.error(f"Ошибка переноса сайта {url}: {e}")
+                continue
+        
+        logging.info(f"Миграция завершена. Перенесено записей: {migrated_count}")
+        
+        # Создаем резервную копию перед удалением
+        backup_path = f'sites_monitor_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
+        import shutil
+        shutil.copy2(sqlite_db_path, backup_path)
+        logging.info(f"Создана резервная копия: {backup_path}")
+        
+        # Удаляем оригинальную SQLite базу
+        os.remove(sqlite_db_path)
+        logging.info("SQLite база данных успешно удалена после миграции.")
+        
+        # Уведомляем админа о завершении миграции
+        migration_message = f"✅ Миграция данных завершена!\n" \
+                          f"📊 Перенесено записей: {migrated_count}\n" \
+                          f"🗃️ Создана резервная копия: {backup_path}\n" \
+                          f"🗑️ SQLite база удалена\n" \
+                          f"⏰ Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
+        await send_admin_notification(migration_message)
+        
+    except Exception as e:
+        logging.error(f"Ошибка миграции данных: {e}")
+        error_message = f"❌ Ошибка миграции данных: {str(e)}\n" \
+                      f"SQLite база НЕ была удалена из-за ошибки."
+        await send_admin_notification(error_message)
 
 
 async def send_admin_notification(message: str):
@@ -65,12 +180,8 @@ async def send_admin_notification(message: str):
 def get_sites_count():
     """Возвращает количество сайтов в базе данных"""
     try:
-        conn = sqlite3.connect('sites_monitor.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT COUNT(*) FROM sites")
-        count = cursor.fetchone()[0]
-        conn.close()
-        return count
+        result = supabase.table('botmonitor_sites').select('id', count='exact').execute()
+        return result.count
     except Exception as e:
         logging.error(f"Ошибка получения количества сайтов: {e}")
         return 0
@@ -157,24 +268,24 @@ async def check_ssl_certificate(url):
         }
 
 
+async def take_screenshot(url: str) -> BytesIO:
+    try:
+        async with async_playwright() as p:
+            browser = await p.chromium.launch(headless=True)
+            page = await browser.new_page(viewport={'width': 1920, 'height': 1080})
+            await page.goto(url, wait_until='networkidle', timeout=30000)
+            screenshot = await page.screenshot(full_page=False, type='png')
+            await browser.close()
+            return BytesIO(screenshot)
+    except Exception as e:
+        logging.error(f"Error taking screenshot: {e}")
+        return None
+
+
 # Настройка базы данных
 def init_db():
-    conn = sqlite3.connect('sites_monitor.db')
-    cursor = conn.cursor()
-    cursor.execute('''
-    CREATE TABLE IF NOT EXISTS sites (
-        id INTEGER PRIMARY KEY,
-        url TEXT NOT NULL,
-        original_url TEXT,
-        user_id INTEGER NOT NULL,
-        is_up BOOLEAN DEFAULT 1,
-        has_ssl BOOLEAN DEFAULT 0,
-        ssl_expires_at TIMESTAMP,
-        last_check TIMESTAMP
-    )
-    ''')
-    conn.commit()
-    conn.close()
+    # Таблица создается через SQL в Supabase Dashboard
+    pass
 
 
 # Состояния для добавления сайта
@@ -192,7 +303,8 @@ async def cmd_start(message: Message):
         "/list - показать список отслеживаемых сайтов\n"
         "/remove - удалить сайт из мониторинга\n"
         "/status - проверить статус всех сайтов\n"
-        "/help - показать справку"
+        "/help - показать справку\n"
+        "/screenshot ID - сделать скриншот сайта"
     )
 
 
@@ -205,7 +317,8 @@ async def cmd_help(message: Message):
         "/list - показать список всех отслеживаемых вами сайтов\n"
         "/remove - удалить сайт из мониторинга\n"
         "/status - выполнить проверку статуса всех сайтов\n"
-        "/help - показать эту справку\n\n"
+        "/help - показать эту справку\n"
+        "/screenshot ID - сделать скриншот сайта\n\n"
         "Бот автоматически проверяет доступность сайтов каждые 5 минут.\n"
         "Вы можете добавлять сайты с кириллическими доменами (например, цифровизируем.рф).\n"
         "Протокол (http:// или https://) добавляется автоматически, если не указан.\n"
@@ -216,6 +329,12 @@ async def cmd_help(message: Message):
 # Обработчик команды /add
 @dp.message(Command("add"))
 async def cmd_add(message: Message, state: FSMContext):
+    # Проверка прав для групп
+    if message.chat.type in ['group', 'supergroup']:
+        if not await is_admin_in_chat(message.chat.id, message.from_user.id):
+            await message.answer("Только администраторы могут добавлять сайты для мониторинга в группе.")
+            return
+    
     await state.set_state(AddSite.waiting_for_url)
     await message.answer("Отправьте URL сайта, который хотите мониторить.\nНапример: example.com или цифровизируем.рф")
 
@@ -226,16 +345,10 @@ async def process_url_input(message: Message, state: FSMContext):
     original_url = message.text.strip()
     url = process_url(original_url)
 
-    conn = sqlite3.connect('sites_monitor.db')
-    cursor = conn.cursor()
-
     # Проверка, существует ли уже такой URL для этого пользователя
-    cursor.execute("SELECT id FROM sites WHERE url = ? AND user_id = ?", (url, message.from_user.id))
-    existing = cursor.fetchone()
-
-    if existing:
+    existing = supabase.table('botmonitor_sites').select('id').eq('url', url).eq('chat_id', message.chat.id).execute()
+    if existing.data:
         await message.answer(f"⚠️ Сайт {original_url} уже добавлен в мониторинг.")
-        conn.close()
         await state.clear()
         return
 
@@ -276,12 +389,17 @@ async def process_url_input(message: Message, state: FSMContext):
             ssl_message = "\n❌ SSL сертификат не найден или недействителен."
 
     # Записываем сайт в базу данных
-    cursor.execute(
-        "INSERT INTO sites (url, original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check) VALUES (?, ?, ?, ?, ?, ?, ?)",
-        (url, original_url, message.from_user.id, is_up, has_ssl, ssl_expires_at, datetime.now())
-    )
-    conn.commit()
-    conn.close()
+    result = supabase.table('botmonitor_sites').insert({
+        'url': url,
+        'original_url': original_url,
+        'user_id': message.from_user.id,
+        'chat_id': message.chat.id,
+        'chat_type': message.chat.type,
+        'is_up': is_up,
+        'has_ssl': has_ssl,
+        'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
+        'last_check': datetime.now().isoformat()
+    }).execute()
 
     # Если URL был преобразован, показываем пользователю информацию о конвертации
     punycode_info = ""
@@ -307,14 +425,8 @@ async def process_url_input(message: Message, state: FSMContext):
 # Обработчик команды /list
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    conn = sqlite3.connect('sites_monitor.db')
-    cursor = conn.cursor()
-    cursor.execute("""
-        SELECT id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check 
-        FROM sites WHERE user_id = ?
-    """, (message.from_user.id,))
-    sites = cursor.fetchall()
-    conn.close()
+    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+    sites = [(s['id'], s['url'], s['original_url'], s['is_up'], s['has_ssl'], s['ssl_expires_at'], s['last_check']) for s in sites_data.data]
 
     if not sites:
         await message.answer("📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
@@ -325,14 +437,13 @@ async def cmd_list(message: Message):
         # Используем оригинальный URL для отображения, если он есть
         display_url = original_url if original_url else url
         status = "✅ доступен" if is_up else "❌ недоступен"
-        last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check).strftime(
-            "%d.%m.%Y %H:%M:%S")
+        last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check.replace('Z', '+00:00')).strftime("%d.%m.%Y %H:%M:%S")
 
         site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status}\n"
 
         # Добавляем информацию о SSL сертификате
         if has_ssl and ssl_expires_at:
-            expiry_date = datetime.fromisoformat(ssl_expires_at)
+            expiry_date = datetime.fromisoformat(ssl_expires_at.replace('Z', '+00:00'))
             days_left = (expiry_date - datetime.now()).days
             if days_left <= 0:
                 ssl_status = "⚠️ SSL сертификат ИСТЁК!"
@@ -358,11 +469,8 @@ async def cmd_remove(message: Message):
     args = command_parts[1] if len(command_parts) > 1 else None
 
     if not args:
-        conn = sqlite3.connect('sites_monitor.db')
-        cursor = conn.cursor()
-        cursor.execute("SELECT id, original_url, url FROM sites WHERE user_id = ?", (message.from_user.id,))
-        sites = cursor.fetchall()
-        conn.close()
+        sites_data = supabase.table('botmonitor_sites').select('id, original_url, url').eq('chat_id', message.chat.id).execute()
+        sites = [(s['id'], s['original_url'], s['url']) for s in sites_data.data]
 
         if not sites:
             await message.answer("📝 Список отслеживаемых сайтов пуст.")
@@ -382,31 +490,23 @@ async def cmd_remove(message: Message):
         await message.answer("❌ ID должен быть числом.")
         return
 
-    conn = sqlite3.connect('sites_monitor.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT original_url, url FROM sites WHERE id = ? AND user_id = ?", (site_id, message.from_user.id))
-    site = cursor.fetchone()
+    site_data = supabase.table('botmonitor_sites').select('original_url, url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+    site = (site_data.data[0]['original_url'], site_data.data[0]['url']) if site_data.data else None
 
     if not site:
         await message.answer(f"❌ Сайт с ID {site_id} не найден или не принадлежит вам.")
     else:
         original_url, url = site
         display_url = original_url if original_url else url
-        cursor.execute("DELETE FROM sites WHERE id = ? AND user_id = ?", (site_id, message.from_user.id))
-        conn.commit()
+        supabase.table('botmonitor_sites').delete().eq('id', site_id).eq('chat_id', message.chat.id).execute()
         await message.answer(f"✅ Сайт {display_url} удален из мониторинга.")
-
-    conn.close()
 
 
 # Обработчик команды /status
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    conn = sqlite3.connect('sites_monitor.db')
-    cursor = conn.cursor()
-    cursor.execute("SELECT id, url, original_url FROM sites WHERE user_id = ?", (message.from_user.id,))
-    sites = cursor.fetchall()
-    conn.close()
+    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url').eq('chat_id', message.chat.id).execute()
+    sites = [(s['id'], s['url'], s['original_url']) for s in sites_data.data]
 
     if not sites:
         await message.answer("📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
@@ -450,17 +550,52 @@ async def cmd_status(message: Message):
         results.append(site_info)
 
         # Обновляем статус в БД
-        conn = sqlite3.connect('sites_monitor.db')
-        cursor = conn.cursor()
-        cursor.execute(
-            "UPDATE sites SET is_up = ?, has_ssl = ?, ssl_expires_at = ?, last_check = ? WHERE id = ?",
-            (1 if status else 0, 1 if has_ssl else 0, ssl_expires_at, datetime.now(), site_id)
-        )
-        conn.commit()
-        conn.close()
+        supabase.table('botmonitor_sites').update({
+            'is_up': status,
+            'has_ssl': has_ssl,
+            'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
+            'last_check': datetime.now().isoformat()
+        }).eq('id', site_id).execute()
 
     response = "📊 Результаты проверки:\n\n" + "\n\n".join(results)
     await bot.edit_message_text(response, chat_id=message.chat.id, message_id=msg.message_id)
+
+
+@dp.message(Command("screenshot"))
+async def cmd_screenshot(message: Message):
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) < 2:
+        await message.answer("Укажите ID сайта: /screenshot ID")
+        return
+    
+    try:
+        site_id = int(command_parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+        
+    site_data = supabase.table('botmonitor_sites').select('url, original_url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+    site = (site_data.data[0]['url'], site_data.data[0]['original_url']) if site_data.data else None
+    
+    if not site:
+        await message.answer(f"Сайт с ID {site_id} не найден в этом чате.")
+        return
+        
+    url, original_url = site
+    display_url = original_url if original_url else url
+    
+    msg = await message.answer(f"Создаю скриншот для {display_url}...")
+    
+    screenshot = await take_screenshot(url)
+    if screenshot:
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=types.BufferedInputFile(screenshot.getvalue(), filename=f"screenshot_{site_id}.png"),
+            caption=f"Скриншот сайта: {display_url}"
+        )
+        await bot.delete_message(message.chat.id, msg.message_id)
+    else:
+        await bot.edit_message_text("Ошибка создания скриншота", message.chat.id, msg.message_id)
 
 
 # Функция проверки доступности сайта
@@ -477,12 +612,10 @@ async def check_site(url):
 async def scheduled_check():
     while True:
         try:
-            conn = sqlite3.connect('sites_monitor.db')
-            cursor = conn.cursor()
-            cursor.execute("SELECT id, url, original_url, user_id, is_up, has_ssl, ssl_expires_at FROM sites")
-            sites = cursor.fetchall()
+            sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, user_id, chat_id, is_up, has_ssl, ssl_expires_at').execute()
+            sites = [(s['id'], s['url'], s['original_url'], s['user_id'], s['chat_id'], s['is_up'], s['has_ssl'], s['ssl_expires_at']) for s in sites_data.data]
 
-            for site_id, url, original_url, user_id, was_up, had_ssl, old_ssl_expires_at in sites:
+            for site_id, url, original_url, user_id, chat_id, was_up, had_ssl, old_ssl_expires_at in sites:
                 display_url = original_url if original_url else url
                 now = datetime.now()
 
@@ -496,6 +629,10 @@ async def scheduled_check():
                 ssl_expires_at = old_ssl_expires_at
                 ssl_changed = False
                 ssl_warning = False
+                
+                # Обработка парсинга дат из Supabase
+                if old_ssl_expires_at and isinstance(old_ssl_expires_at, str):
+                    old_ssl_expires_at = datetime.fromisoformat(old_ssl_expires_at.replace('Z', '+00:00'))
 
                 if status and url.startswith('https://'):
                     ssl_info = await check_ssl_certificate(url)
@@ -512,10 +649,12 @@ async def scheduled_check():
                                 ssl_warning = True
 
                 # Обновляем статус в БД
-                cursor.execute(
-                    "UPDATE sites SET is_up = ?, has_ssl = ?, ssl_expires_at = ?, last_check = ? WHERE id = ?",
-                    (1 if status else 0, 1 if has_ssl else 0, ssl_expires_at, now, site_id)
-                )
+                supabase.table('botmonitor_sites').update({
+                    'is_up': status,
+                    'has_ssl': has_ssl,
+                    'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at and hasattr(ssl_expires_at, 'isoformat') else ssl_expires_at,
+                    'last_check': now.isoformat()
+                }).eq('id', site_id).execute()
 
                 # Отправляем уведомления при изменении статуса
                 try:
@@ -525,7 +664,7 @@ async def scheduled_check():
                             message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
                         else:
                             message = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
-                        await bot.send_message(chat_id=user_id, text=message)
+                        await bot.send_message(chat_id=chat_id, text=message)
 
                     # Уведомление об изменении SSL
                     if ssl_changed and has_ssl:
@@ -535,7 +674,7 @@ async def scheduled_check():
                             message += "⚠️ Сертификат ИСТЁК! Требуется обновление."
                         elif ssl_info.get('expires_soon'):
                             message += f"⚠️ Сертификат истекает через {days_left} дней!"
-                        await bot.send_message(chat_id=user_id, text=message)
+                        await bot.send_message(chat_id=chat_id, text=message)
 
                     # Уведомление о скором истечении SSL
                     elif ssl_warning and has_ssl:
@@ -544,13 +683,11 @@ async def scheduled_check():
                             message = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
                         else:
                             message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!\nРекомендуется обновить сертификат."
-                        await bot.send_message(chat_id=user_id, text=message)
+                        await bot.send_message(chat_id=chat_id, text=message)
 
                 except Exception as e:
-                    logging.error(f"Error sending notification to user {user_id}: {e}")
+                    logging.error(f"Error sending notification to chat {chat_id}: {e}")
 
-            conn.commit()
-            conn.close()
 
         except Exception as e:
             logging.error(f"Error in scheduled check: {e}")
@@ -566,7 +703,8 @@ async def on_startup():
 
 async def main():
     init_db()
-    update_db()  # Add this line
+    # Автоматическая миграция при запуске, если есть SQLite база
+    await migrate_from_sqlite()
     
     # Получаем количество сайтов в базе данных
     sites_count = get_sites_count()
