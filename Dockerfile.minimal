@@ -1,33 +1,11 @@
-# Используем официальный Python образ
+# Минимальный Dockerfile для botMonitoring
 FROM python:3.11-slim
 
-# Устанавливаем системные зависимости для Playwright
+# Устанавливаем только базовые зависимости
 RUN apt-get update && apt-get install -y \
     wget \
     gnupg \
     ca-certificates \
-    procps \
-    libxss1 \
-    libxrandr2 \
-    libasound2 \
-    libpangocairo-1.0-0 \
-    libatk1.0-0 \
-    libcairo-gobject2 \
-    libgtk-3-0 \
-    libgdk-pixbuf-2.0-0 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrender1 \
-    libxtst6 \
-    libnss3 \
-    libcups2 \
-    libatspi2.0-0 \
-    libdrm2 \
-    libxkbcommon0 \
     && rm -rf /var/lib/apt/lists/*
 
 # Устанавливаем рабочую директорию
@@ -39,7 +17,7 @@ COPY requirements.txt .
 # Устанавливаем Python зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем браузеры Playwright
+# Устанавливаем браузеры Playwright и их зависимости автоматически
 RUN playwright install chromium
 RUN playwright install-deps chromium
 
