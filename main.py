@@ -959,6 +959,192 @@ async def process_hosting_date_input(message: Message, state: FSMContext):
         await message.answer("❌ Неверный формат даты. Используйте формат YYYY-MM-DD (например: 2024-12-31)")
 
 
+# Вспомогательные функции для обработки команд в группах
+async def handle_screenshot_command(message: Message, args: str):
+    """Обработка команды /screenshot в группе"""
+    if not args:
+        await safe_reply_message(message, "Укажите ID сайта или URL: @бот /screenshot ID или @бот /screenshot URL")
+        return
+    
+    argument = args.strip()
+    
+    # Проверяем, является ли аргумент числом (ID)
+    try:
+        site_id = int(argument)
+        # Это ID - ищем сайт в базе данных
+        site_data = supabase.table('botmonitor_sites').select('url, original_url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+        site = (site_data.data[0]['url'], site_data.data[0]['original_url']) if site_data.data else None
+        
+        if not site:
+            await safe_reply_message(message, f"Сайт с ID {site_id} не найден в этом чате.")
+            return
+            
+        url, original_url = site
+        display_url = original_url if original_url else url
+        filename_suffix = f"id_{site_id}"
+        
+    except ValueError:
+        # Это не число - считаем это URL
+        url = process_url(argument)
+        display_url = argument  # Показываем оригинальный URL пользователю
+        filename_suffix = "url_" + argument.replace("://", "_").replace("/", "_").replace(".", "_")
+    
+    msg = await safe_reply_message(message, f"Создаю скриншот для {display_url}...")
+    
+    screenshot = await take_screenshot(url)
+    
+    if screenshot:
+        await bot.send_photo(
+            chat_id=message.chat.id,
+            photo=types.BufferedInputFile(screenshot.getvalue(), filename=f"screenshot_{filename_suffix}.png"),
+            caption=f"Скриншот сайта: {display_url}"
+        )
+        if msg:
+            await bot.delete_message(message.chat.id, msg.message_id)
+    else:
+        if msg:
+            await bot.edit_message_text("Ошибка создания скриншота. Проверьте API ключ ScreenshotMachine.", 
+                                      chat_id=message.chat.id, message_id=msg.message_id)
+
+async def handle_status_command(message: Message):
+    """Обработка команды /status в группе"""
+    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url').eq('chat_id', message.chat.id).execute()
+    sites = [(s['id'], s['url'], s['original_url']) for s in sites_data.data]
+
+    if not sites:
+        await safe_reply_message(message, "📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
+        return
+
+    msg = await safe_reply_message(message, "🔄 Проверяю доступность сайтов...")
+
+    results = []
+    for site_id, url, original_url in sites:
+        display_url = original_url if original_url else url
+
+        # Проверяем доступность сайта
+        status, status_code = await check_site(url)
+        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code})"
+        site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
+
+        # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
+        ssl_info = None
+        has_ssl = False
+        ssl_expires_at = None
+
+        if status and url.startswith('https://'):
+            ssl_info = await check_ssl_certificate(url)
+            has_ssl = ssl_info.get('has_ssl', False)
+
+            if has_ssl:
+                expiry_date = ssl_info.get('expiry_date')
+                days_left = ssl_info.get('days_left')
+
+                if ssl_info.get('expired'):
+                    site_info += f"\n⚠️ SSL сертификат ИСТЁК!"
+                elif ssl_info.get('expires_soon'):
+                    site_info += f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+                else:
+                    site_info += f"\nSSL действителен ещё {days_left} дней"
+
+                ssl_expires_at = expiry_date
+            else:
+                site_info += "\n❌ SSL сертификат не найден или недействителен"
+
+        results.append(site_info)
+
+        # Обновляем статус в БД
+        supabase.table('botmonitor_sites').update({
+            'is_up': status,
+            'has_ssl': has_ssl,
+            'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
+            'last_check': datetime.now(timezone.utc).isoformat()
+        }).eq('id', site_id).execute()
+
+    response = "📊 Результаты проверки:\n\n" + "\n\n".join(results)
+    if msg:
+        await bot.edit_message_text(response, chat_id=message.chat.id, message_id=msg.message_id)
+
+async def handle_list_command(message: Message):
+    """Обработка команды /list в группе"""
+    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check, is_reserve_domain').eq('chat_id', message.chat.id).execute()
+    sites = sites_data.data
+
+    if not sites:
+        await safe_reply_message(message, "📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
+        return
+
+    response = "📝 Список отслеживаемых сайтов:\n\n"
+    for site in sites:
+        site_id = site['id']
+        url = site['url']
+        original_url = site['original_url']
+        is_up = site['is_up']
+        has_ssl = site['has_ssl']
+        ssl_expires_at = site['ssl_expires_at']
+        domain_expires_at = site['domain_expires_at']
+        hosting_expires_at = site['hosting_expires_at']
+        last_check = site['last_check']
+        
+        # Используем оригинальный URL для отображения, если он есть
+        display_url = original_url if original_url else url
+        is_reserve = site.get('is_reserve_domain', False)
+        
+        if is_reserve:
+            status = "🔄 резервный" if is_up else "⏸️ резервный (недоступен)"
+        else:
+            status = "✅ доступен" if is_up else "❌ недоступен"
+            
+        last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check.replace('Z', '+00:00')).strftime("%d.%m.%Y %H:%M:%S")
+
+        site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status}\n"
+
+        # Добавляем информацию о SSL сертификате
+        if has_ssl and ssl_expires_at:
+            expiry_date = datetime.fromisoformat(ssl_expires_at.replace('Z', '+00:00'))
+            days_left = (expiry_date - datetime.now(timezone.utc)).days
+            if days_left <= 0:
+                ssl_status = "⚠️ SSL сертификат ИСТЁК!"
+            elif days_left <= SSL_WARNING_DAYS:
+                ssl_status = f"⚠️ SSL сертификат истекает через {days_left} дней"
+            else:
+                ssl_status = f"SSL действителен ещё {days_left} дней"
+            site_info += f"{ssl_status}\n"
+        elif url.startswith('https://'):
+            site_info += "❌ SSL сертификат не проверен\n"
+
+        # Добавляем информацию о датах истечения домена и хостинга
+        if domain_expires_at:
+            domain_date = datetime.fromisoformat(domain_expires_at).date()
+            domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+            if domain_days_left <= 0:
+                domain_status = f"⚠️ Домен истёк! ({domain_date.strftime('%d.%m.%Y')})"
+            elif domain_days_left <= 30:
+                domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+            else:
+                domain_status = f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+            site_info += f"Домен: {domain_status}\n"
+        else:
+            site_info += "Домен: дата не установлена\n"
+
+        if hosting_expires_at:
+            hosting_date = datetime.fromisoformat(hosting_expires_at).date()
+            hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+            if hosting_days_left <= 0:
+                hosting_status = f"⚠️ Хостинг истёк! ({hosting_date.strftime('%d.%m.%Y')})"
+            elif hosting_days_left <= 30:
+                hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+            else:
+                hosting_status = f"Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+            site_info += f"Хостинг: {hosting_status}\n"
+        else:
+            site_info += "Хостинг: дата не установлена\n"
+
+        site_info += f"Последняя проверка: {last_check_str}\n\n"
+        response += site_info
+
+    await safe_reply_message(message, response)
+
+
 # Обработчик упоминаний бота в группах
 @dp.message(F.chat.type.in_(['group', 'supergroup']), F.text)
 async def handle_group_mention(message: Message):
@@ -969,10 +1155,33 @@ async def handle_group_mention(message: Message):
         # Это обычное сообщение, не для нашего бота, просто выходим
         return
 
-    # Извлекаем домен из сообщения.
-    # Удаляем упоминание бота и лишние пробелы
+    # Извлекаем текст после упоминания бота
     cleaned_text = message.text.replace(f"@{bot_username}", "").strip()
-    # Первое слово после упоминания считаем доменом
+    
+    # Проверяем, является ли первое слово командой
+    if cleaned_text.startswith('/'):
+        # Это команда - обрабатываем её
+        command_parts = cleaned_text.split(maxsplit=1)
+        command = command_parts[0]
+        args = command_parts[1] if len(command_parts) > 1 else ""
+        
+        if command == "/screenshot":
+            # Обрабатываем команду /screenshot
+            await handle_screenshot_command(message, args)
+            return
+        elif command == "/status":
+            # Обрабатываем команду /status
+            await handle_status_command(message)
+            return
+        elif command == "/list":
+            # Обрабатываем команду /list
+            await handle_list_command(message)
+            return
+        else:
+            await safe_reply_message(message, f"Неизвестная команда: {command}")
+            return
+    
+    # Если не команда, то ищем домен как раньше
     domain = cleaned_text.split()[0] if cleaned_text and '.' in cleaned_text.split()[0] else None
 
     # --- НОВАЯ ЛОГИКА ---
