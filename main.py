@@ -1202,7 +1202,7 @@ async def scheduled_check():
     while True:
         try:
             sites_data = supabase.table('botmonitor_sites').select(
-                'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, is_reserve_domain, ssl_last_notification_day'
+                'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, is_reserve_domain, ssl_last_notification_day, domain_last_notification_day, hosting_last_notification_day'
             ).execute()
             sites = sites_data.data
 
@@ -1271,9 +1271,8 @@ async def scheduled_check():
                 # --- НОВЫЙ БЛОК: Проверка дат домена и хостинга с кнопками ---
                 now_date = now.date()
                 
-                # Новая логика уведомлений
-                notification_schedule = {30, 14} # Конкретные дни для уведомлений
-                daily_start_day = 7 # Начиная с 7 дней, уведомляем каждый день
+                # Новая логика уведомлений - только в конкретные дни
+                notification_days = {30, 14, 7, 6, 5, 4, 3, 2, 1}
 
                 # Проверка домена
                 if site.get('domain_expires_at'):
@@ -1281,28 +1280,44 @@ async def scheduled_check():
                     days_left = (domain_expiry_date - now_date).days
                     
                     # Проверяем, наступил ли день для уведомления
-                    should_notify = (days_left in notification_schedule) or (0 <= days_left <= daily_start_day)
-
+                    should_notify = days_left in notification_days or days_left <= 0
+                    
+                    # Проверяем, не отправляли ли уже уведомление сегодня
                     if should_notify:
-                        message = f"‼️ **Домен:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({domain_expiry_date.strftime('%d.%m.%Y')})!"
-                        keyboard = get_renewal_keyboard(site['id'], "domain")
-                        # Отправляем уведомление с кнопками
-                        target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
-                        await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
+                        last_domain_notification = site.get('domain_last_notification_day')
+                        if last_domain_notification != now_date or last_domain_notification is None:
+                            message = f"‼️ **Домен:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({domain_expiry_date.strftime('%d.%m.%Y')})!"
+                            keyboard = get_renewal_keyboard(site['id'], "domain")
+                            # Отправляем уведомление с кнопками
+                            target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+                            await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
+                            
+                            # Обновляем дату последнего уведомления о домене
+                            supabase.table('botmonitor_sites').update({
+                                'domain_last_notification_day': now_date.isoformat()
+                            }).eq('id', site_id).execute()
 
                 # Проверка хостинга
                 if site.get('hosting_expires_at'):
                     hosting_expiry_date = datetime.fromisoformat(site['hosting_expires_at']).date()
                     days_left = (hosting_expiry_date - now_date).days
                     
-                    should_notify = (days_left in notification_schedule) or (0 <= days_left <= daily_start_day)
-
+                    should_notify = days_left in notification_days or days_left <= 0
+                    
+                    # Проверяем, не отправляли ли уже уведомление сегодня
                     if should_notify:
-                        message = f"🖥️ **Хостинг:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
-                        keyboard = get_renewal_keyboard(site['id'], "hosting")
-                        # Отправляем уведомление с кнопками
-                        target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
-                        await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
+                        last_hosting_notification = site.get('hosting_last_notification_day')
+                        if last_hosting_notification != now_date or last_hosting_notification is None:
+                            message = f"🖥️ **Хостинг:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
+                            keyboard = get_renewal_keyboard(site['id'], "hosting")
+                            # Отправляем уведомление с кнопками
+                            target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+                            await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
+                            
+                            # Обновляем дату последнего уведомления о хостинге
+                            supabase.table('botmonitor_sites').update({
+                                'hosting_last_notification_day': now_date.isoformat()
+                            }).eq('id', site_id).execute()
 
         except Exception as e:
             logging.error(f"Error in scheduled check: {e}")
