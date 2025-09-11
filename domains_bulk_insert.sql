@@ -32,6 +32,13 @@ INSERT INTO botmonitor_sites (
 -- Домены с датой истечения домена 27.04.2026 (БЕЗ хостинга)
 ('https://progres82.ru', 'progres82.ru', {USER_ID}, {CHAT_ID}, 'private', true, true, '2026-04-27', NULL, NOW(), NOW()),
 
+-- Домены с датой истечения домена 03.05.2026 (БЕЗ хостинга)
+('https://миндаль.рус', 'миндаль.рус', {USER_ID}, {CHAT_ID}, 'private', true, true, '2026-05-03', NULL, NOW(), NOW()),
+('https://кварталминдаль.рф', 'кварталминдаль.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, '2026-05-03', NULL, NOW(), NOW()),
+('https://квартал-миндаль.рф', 'квартал-миндаль.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, '2026-05-03', NULL, NOW(), NOW()),
+('https://жк-миндаль.рф', 'жк-миндаль.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, '2026-05-03', NULL, NOW(), NOW()),
+('https://kvartal-mindal.ru', 'kvartal-mindal.ru', {USER_ID}, {CHAT_ID}, 'private', true, true, '2026-05-03', NULL, NOW(), NOW()),
+
 -- Домен без даты истечения домена и хостинга (бархат-новыйсвет.рф)
 ('https://бархат-новыйсвет.рф', 'бархат-новыйсвет.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, NULL, NULL, NOW(), NOW()),
 
