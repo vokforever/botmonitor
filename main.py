@@ -7,12 +7,13 @@ import socket
 import OpenSSL
 import os
 from datetime import datetime, timedelta, timezone
+from dateutil.relativedelta import relativedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
-from aiogram.types import Message
+from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -348,6 +349,7 @@ async def cmd_start(message: Message):
         "/status - проверить статус всех сайтов\n"
         "/setdomain ID - установить дату истечения домена\n"
         "/sethosting ID - установить дату истечения хостинга\n"
+        "/myid - показать ваш User ID и Chat ID\n"
         "/help - показать справку\n"
         "/screenshot ID - сделать скриншот сайта\n"
         "/diagnose - диагностика ScreenshotMachine API"
@@ -355,6 +357,11 @@ async def cmd_start(message: Message):
 
 
 # Обработчик команды /help
+@dp.message(Command("myid"))
+async def cmd_myid(message: Message):
+    """Команда для получения USER_ID и CHAT_ID"""
+    await message.answer(f"User ID: `{message.from_user.id}`\nChat ID: `{message.chat.id}`", parse_mode="Markdown")
+
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
     help_text = "ℹ️ Справка по командам:\n\n"
@@ -371,6 +378,7 @@ async def cmd_help(message: Message):
     help_text += "/status - выполнить проверку статуса всех сайтов\n"
     help_text += "/setdomain [ID] - установить дату истечения домена\n"
     help_text += "/sethosting [ID] - установить дату истечения хостинга\n"
+    help_text += "/myid - показать ваш User ID и Chat ID\n"
     help_text += "/screenshot [ID] - сделать скриншот сайта\n"
     help_text += "/diagnose - диагностика ScreenshotMachine API\n"
     help_text += "/help - показать эту справку\n\n"
@@ -411,24 +419,30 @@ async def process_url_input(message: Message, state: FSMContext):
     await process_and_add_site(message.text, message, state)
 
 # НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ для добавления сайта (чтобы не дублировать код)
+# ФИНАЛЬНАЯ ВЕРСИЯ: "Перезапись" чата при добавлении
 async def process_and_add_site(original_url: str, message: Message, state: FSMContext):
+    await state.clear()
     url = process_url(original_url)
-    # Проверка, существует ли уже такой URL для этого пользователя
-    existing = supabase.table('botmonitor_sites').select('id').eq('url', url).eq('chat_id', message.chat.id).execute()
-    if existing.data:
-        await message.answer(f"⚠️ Сайт {original_url} уже добавлен в мониторинг.")
-        await state.clear()
+
+    # 1. Ищем сайт в базе данных по URL, независимо от chat_id
+    existing_site_data = supabase.table('botmonitor_sites').select('id, chat_id').eq('url', url).limit(1).execute()
+    existing_site = existing_site_data.data[0] if existing_site_data.data else None
+
+    # Если сайт уже привязан к ЭТОМУ чату, ничего не делаем
+    if existing_site and str(existing_site.get('chat_id')) == str(message.chat.id):
+        await message.answer(f"✅ Сайт {original_url} уже отслеживается в этом чате.")
         return
-        
-    # Сначала сообщаем о начале проверки
-    status_msg = await message.answer(f"🔄 Проверяю доступность сайта {original_url}...")
+
+    # --- Общая часть для проверки статуса ---
+    status_msg_text = f"🔄 Проверяю доступность сайта {original_url}..."
+    if existing_site:
+        status_msg_text = f"🔄 Сайт {original_url} уже есть в базе. Перемещаю его в этот чат и проверяю статус..."
     
-    # Проверяем доступность сайта перед добавлением
+    status_msg = await message.answer(status_msg_text)
+    
     status, status_code = await check_site(url)
     is_up = 1 if status else 0
     
-    # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
-    ssl_info = None
     has_ssl = 0
     ssl_expires_at = None
     ssl_message = ""
@@ -447,18 +461,15 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
                 ssl_message = f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
             else:
                 ssl_message = f"\nSSL сертификат действителен ещё {days_left} дней."
-            # Используем .get для безопасного извлечения данных
-            subject_name = ssl_info.get('subject', 'N/A')
-            issuer_name = ssl_info.get('issuer', 'N/A')
-            ssl_message += f"\nВыдан: {subject_name}"
-            ssl_message += f"\nЦентр сертификации: {issuer_name}"
         else:
             ssl_message = "\n❌ SSL сертификат не найден или недействителен."
-            
-    # Записываем сайт в базу данных
-    supabase.table('botmonitor_sites').insert({
-        'url': url,
-        'original_url': original_url,
+    # --- Конец общей части ---
+
+    punycode_info = ""
+    if url != original_url and "xn--" in url:
+        punycode_info = f"\nПреобразовано в: {url}"
+
+    payload = {
         'user_id': message.from_user.id,
         'chat_id': message.chat.id,
         'chat_type': message.chat.type,
@@ -466,31 +477,63 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
         'has_ssl': has_ssl,
         'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
         'last_check': datetime.now(timezone.utc).isoformat()
-    }).execute()
-    
-    punycode_info = ""
-    if url != original_url and "xn--" in url:
-        punycode_info = f"\nПреобразовано в: {url}"
+    }
+
+    if existing_site:
+        # 2. САЙТ НАЙДЕН -> ВЫПОЛНЯЕМ UPDATE
+        supabase.table('botmonitor_sites').update(payload).eq('id', existing_site['id']).execute()
         
-    if status:
-        await bot.edit_message_text(
-            f"✅ Сайт {original_url} добавлен в мониторинг и сейчас доступен (код ответа: {status_code}).{punycode_info}{ssl_message}",
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id
-        )
+        final_message = f"✅ Сайт {original_url} был **перемещен** в этот чат.\nТекущий статус: {'доступен' if status else 'недоступен'} (код {status_code}).{punycode_info}{ssl_message}"
+        await bot.edit_message_text(final_message, chat_id=message.chat.id, message_id=status_msg.message_id)
+
     else:
-        await bot.edit_message_text(
-            f"⚠️ Сайт {original_url} добавлен в мониторинг, но сейчас НЕ доступен (код ответа: {status_code}).{punycode_info}",
-            chat_id=message.chat.id,
-            message_id=status_msg.message_id
-        )
-    await state.clear()
+        # 3. САЙТ НЕ НАЙДЕН -> ВЫПОЛНЯЕМ INSERT
+        payload['url'] = url
+        payload['original_url'] = original_url
+        
+        supabase.table('botmonitor_sites').insert(payload).execute()
+        
+        final_message = f"✅ Сайт {original_url} **добавлен** в мониторинг.\nСтатус: {'доступен' if status else 'недоступен'} (код {status_code}).{punycode_info}{ssl_message}"
+        await bot.edit_message_text(final_message, chat_id=message.chat.id, message_id=status_msg.message_id)
+
+
+# Обработчик команды /reserve - переключение статуса резервного домена
+@dp.message(Command("reserve"))
+async def cmd_reserve(message: Message):
+    """Переключает статус резервного домена для сайта"""
+    args = message.text.split()
+    if len(args) != 2:
+        await message.answer("Использование: /reserve <ID_сайта>\nПример: /reserve 123")
+        return
+    
+    try:
+        site_id = int(args[1])
+    except ValueError:
+        await message.answer("ID сайта должен быть числом")
+        return
+    
+    # Получаем информацию о сайте
+    site_data = supabase.table('botmonitor_sites').select('id, original_url, is_reserve_domain').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+    
+    if not site_data.data:
+        await message.answer("Сайт с таким ID не найден в этом чате")
+        return
+    
+    site = site_data.data[0]
+    current_status = site.get('is_reserve_domain', False)
+    new_status = not current_status
+    
+    # Обновляем статус
+    supabase.table('botmonitor_sites').update({'is_reserve_domain': new_status}).eq('id', site_id).execute()
+    
+    status_text = "резервным" if new_status else "обычным"
+    await message.answer(f"✅ Сайт {site['original_url']} теперь является {status_text} доменом")
 
 
 # Обработчик команды /list
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check, is_reserve_domain').eq('chat_id', message.chat.id).execute()
     sites = sites_data.data
 
     if not sites:
@@ -511,7 +554,13 @@ async def cmd_list(message: Message):
         
         # Используем оригинальный URL для отображения, если он есть
         display_url = original_url if original_url else url
-        status = "✅ доступен" if is_up else "❌ недоступен"
+        is_reserve = site.get('is_reserve_domain', False)
+        
+        if is_reserve:
+            status = "🔄 резервный" if is_up else "⏸️ резервный (недоступен)"
+        else:
+            status = "✅ доступен" if is_up else "❌ недоступен"
+            
         last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check.replace('Z', '+00:00')).strftime("%d.%m.%Y %H:%M:%S")
 
         site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status}\n"
@@ -1006,20 +1055,164 @@ async def check_site(url):
         return False, 0
 
 
-# Функция периодической проверки всех сайтов
+# --- НОВЫЙ БЛОК: Данные для массового импорта ---
+
+SITES_FOR_IMPORT = [
+    # Даты в формате 'ГГГГ-ММ-ДД'. None означает NULL в базе данных.
+    
+    # Домены с датой истечения домена 30.03.2026
+    {'url': 'https://прогрэсс.рф', 'original_url': 'прогрэсс.рф', 'domain_expires_at': '2026-03-30', 'hosting_expires_at': None},
+    {'url': 'https://прогрэс.рф', 'original_url': 'прогрэс.рф', 'domain_expires_at': '2026-03-30', 'hosting_expires_at': None},
+    {'url': 'https://про-гресс.рф', 'original_url': 'про-гресс.рф', 'domain_expires_at': '2026-03-30', 'hosting_expires_at': None},
+    {'url': 'https://жкпрогресс.рф', 'original_url': 'жкпрогресс.рф', 'domain_expires_at': '2026-03-30', 'hosting_expires_at': None},
+
+    # Домены с датой истечения домена 13.05.2026
+    {'url': 'https://жкалькор.рф', 'original_url': 'жкалькор.рф', 'domain_expires_at': '2026-05-13', 'hosting_expires_at': None},
+    {'url': 'https://жк-алькор.рф', 'original_url': 'жк-алькор.рф', 'domain_expires_at': '2026-05-13', 'hosting_expires_at': None},
+    {'url': 'https://алькор82.рф', 'original_url': 'алькор82.рф', 'domain_expires_at': '2026-05-13', 'hosting_expires_at': None},
+    {'url': 'https://jkalkor.ru', 'original_url': 'jkalkor.ru', 'domain_expires_at': '2026-05-13', 'hosting_expires_at': None},
+
+    # Домены с датой истечения домена 27.04.2026
+    {'url': 'https://progres82.ru', 'original_url': 'progres82.ru', 'domain_expires_at': '2026-04-27', 'hosting_expires_at': None},
+
+    # Домены с датой истечения домена 03.05.2026
+    {'url': 'https://миндаль.рус', 'original_url': 'миндаль.рус', 'domain_expires_at': '2026-05-03', 'hosting_expires_at': None},
+    {'url': 'https://кварталминдаль.рф', 'original_url': 'кварталминдаль.рф', 'domain_expires_at': '2026-05-03', 'hosting_expires_at': None},
+    {'url': 'https://квартал-миндаль.рф', 'original_url': 'квартал-миндаль.рф', 'domain_expires_at': '2026-05-03', 'hosting_expires_at': None},
+    {'url': 'https://жк-миндаль.рф', 'original_url': 'жк-миндаль.рф', 'domain_expires_at': '2026-05-03', 'hosting_expires_at': None},
+    {'url': 'https://kvartal-mindal.ru', 'original_url': 'kvartal-mindal.ru', 'domain_expires_at': '2026-05-03', 'hosting_expires_at': None},
+    
+    # Домены ТОЛЬКО с хостингом - 02.07.2026
+    {'url': 'https://vladograd.com', 'original_url': 'vladograd.com', 'domain_expires_at': None, 'hosting_expires_at': '2026-07-02'},
+
+    # Домен с доменом и хостингом - жигулинароща.рф
+    {'url': 'https://жигулинароща.рф', 'original_url': 'жигулинароща.рф', 'domain_expires_at': '2026-06-03', 'hosting_expires_at': '2026-04-22'},
+
+    # Дополнительные домены с датами истечения
+    {'url': 'https://ccg-crimea.ru', 'original_url': 'ccg-crimea.ru', 'domain_expires_at': '2025-12-07', 'hosting_expires_at': None},
+
+    # Домены с датой истечения 28.05.2026
+    {'url': 'https://siesta-crimea.ru', 'original_url': 'siesta-crimea.ru', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://бархат-евпатория.рф', 'original_url': 'бархат-евпатория.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://вега-крым.рф', 'original_url': 'вега-крым.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://вега-евпатория.рф', 'original_url': 'вега-евпатория.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://бархат-крым.рф', 'original_url': 'бархат-крым.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://barhat-crimea.ru', 'original_url': 'barhat-crimea.ru', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://vega-crimea.ru', 'original_url': 'vega-crimea.ru', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://vega-evpatoria.ru', 'original_url': 'vega-evpatoria.ru', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://сиеста-крым.рф', 'original_url': 'сиеста-крым.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://сиеста-новыйсвет.рф', 'original_url': 'сиеста-новыйсвет.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://бархат-новыйсвет.рф', 'original_url': 'бархат-новыйсвет.рф', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+    {'url': 'https://barhat-evpatoria.ru', 'original_url': 'barhat-evpatoria.ru', 'domain_expires_at': '2026-05-28', 'hosting_expires_at': None},
+
+    # Домены с датой истечения 06.12.2025
+    {'url': 'https://кварталпредгорье.рф', 'original_url': 'кварталпредгорье.рф', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://жкпредгорье.рус', 'original_url': 'жкпредгорье.рус', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://predgorie-crimea.ru', 'original_url': 'predgorie-crimea.ru', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://квартал-предгорье.рф', 'original_url': 'квартал-предгорье.рф', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://жк-предгорье.рф', 'original_url': 'жк-предгорье.рф', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://предгорье.рус', 'original_url': 'предгорье.рус', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://predgorie82.ru', 'original_url': 'predgorie82.ru', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+    {'url': 'https://жкпредгорье.рф', 'original_url': 'жкпредгорье.рф', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': '2026-07-02'},
+    {'url': 'https://predgorie.com', 'original_url': 'predgorie.com', 'domain_expires_at': '2025-12-06', 'hosting_expires_at': None},
+
+    # Дополнительные домены с датами истечения
+    {'url': 'https://moinaco-resort.ru', 'original_url': 'moinaco-resort.ru', 'domain_expires_at': '2026-03-20', 'hosting_expires_at': None},
+    {'url': 'https://moinaco-riviera.ru', 'original_url': 'moinaco-riviera.ru', 'domain_expires_at': '2026-04-28', 'hosting_expires_at': None},
+
+    # Домен с доменом и хостингом - moinaco.ru
+    {'url': 'https://moinaco.ru', 'original_url': 'moinaco.ru', 'domain_expires_at': '2026-01-13', 'hosting_expires_at': '2027-06-21'},
+
+    # Дополнительные домены с датами истечения
+    {'url': 'https://modernatlas.ru', 'original_url': 'modernatlas.ru', 'domain_expires_at': '2025-09-20', 'hosting_expires_at': None},
+    {'url': 'https://atlas-sudak.ru', 'original_url': 'atlas-sudak.ru', 'domain_expires_at': '2026-07-08', 'hosting_expires_at': None},
+    {'url': 'https://atlassudak.com', 'original_url': 'atlassudak.com', 'domain_expires_at': '2026-06-13', 'hosting_expires_at': None},
+
+    # Домен с доменом и хостингом - atlas-apart.ru
+    {'url': 'https://atlas-apart.ru', 'original_url': 'atlas-apart.ru', 'domain_expires_at': '2025-09-11', 'hosting_expires_at': '2026-06-20'},
+
+    # Дополнительные домены с датами истечения
+    {'url': 'https://startprospect82.ru', 'original_url': 'startprospect82.ru', 'domain_expires_at': '2026-05-12', 'hosting_expires_at': None},
+    {'url': 'https://startprospect82.online', 'original_url': 'startprospect82.online', 'domain_expires_at': '2026-05-12', 'hosting_expires_at': None},
+    {'url': 'https://prospect-82.online', 'original_url': 'prospect-82.online', 'domain_expires_at': '2025-09-20', 'hosting_expires_at': None},
+    {'url': 'https://prospect-82.ru', 'original_url': 'prospect-82.ru', 'domain_expires_at': '2025-09-20', 'hosting_expires_at': None},
+    {'url': 'https://проспект-82.рф', 'original_url': 'проспект-82.рф', 'domain_expires_at': '2026-08-22', 'hosting_expires_at': None},
+
+    # Домен с доменом и хостингом - prospect82.ru
+    {'url': 'https://prospect82.ru', 'original_url': 'prospect82.ru', 'domain_expires_at': '2026-08-22', 'hosting_expires_at': '2025-09-14'},
+]
+
+# --- НОВЫЙ БЛОК: Создание клавиатуры и обработка нажатий ---
+
+def get_renewal_keyboard(site_id: int, renewal_type: str) -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопками 'Продлён' и 'Ещё не продлён'."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="✅ Продлён на год", callback_data=f"renew:{renewal_type}:{site_id}"),
+            InlineKeyboardButton(text="OK", callback_data=f"snooze:{renewal_type}:{site_id}")
+        ]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return keyboard
+
+@dp.callback_query(F.data.startswith("renew:"))
+async def handle_renew_callback(callback: CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Продлён'."""
+    try:
+        _, renewal_type, site_id_str = callback.data.split(":")
+        site_id = int(site_id_str)
+
+        # Определяем, какое поле обновлять
+        date_field = "domain_expires_at" if renewal_type == "domain" else "hosting_expires_at"
+
+        # Получаем текущую дату из БД
+        site_data = supabase.table('botmonitor_sites').select(date_field).eq('id', site_id).single().execute()
+        if not site_data.data or not site_data.data.get(date_field):
+            await callback.answer("Ошибка: не найдена текущая дата для продления.", show_alert=True)
+            return
+        
+        current_date = datetime.fromisoformat(site_data.data[date_field]).date()
+        # Добавляем ровно 1 год
+        new_date = current_date + relativedelta(years=1)
+
+        # Обновляем в БД
+        supabase.table('botmonitor_sites').update({date_field: new_date.isoformat()}).eq('id', site_id).execute()
+
+        # Отвечаем на callback и редактируем сообщение
+        await callback.answer(f"Отлично! Срок обновлен до {new_date.strftime('%d.%m.%Y')}", show_alert=True)
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n✅ **Статус обновлен.** Срок продлен до {new_date.strftime('%d.%m.%Y')}."
+        )
+    except Exception as e:
+        logging.error(f"Ошибка в handle_renew_callback: {e}")
+        await callback.answer("Произошла ошибка при обновлении.", show_alert=True)
+
+
+@dp.callback_query(F.data.startswith("snooze:"))
+async def handle_snooze_callback(callback: CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Ещё не продлён' (просто убирает кнопки)."""
+    await callback.answer("OK, принято.")
+    await callback.message.edit_text(
+        f"{callback.message.text}\n\n*OK, вы получили это уведомление.*"
+    )
+
+
+# Функция периодической проверки всех сайтов (ПОЛНОСТЬЮ ЗАМЕНЕНА)
 async def scheduled_check():
     while True:
         try:
-            # Выбираем все поля, включая новые даты
             sites_data = supabase.table('botmonitor_sites').select(
-                'id, url, original_url, user_id, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at'
+                'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, is_reserve_domain'
             ).execute()
             sites = sites_data.data
 
             for site in sites:
-                site_id, url, original_url, user_id, chat_id = site['id'], site['url'], site['original_url'], site['user_id'], site['chat_id']
+                chat_id = site['chat_id']
+                display_url = site['original_url'] or site['url']
+
+                # --- Блок проверки доступности и SSL (остается как раньше) ---
+                site_id, url, original_url = site['id'], site['url'], site['original_url']
                 was_up, had_ssl, old_ssl_expires_at = site['is_up'], site['has_ssl'], site['ssl_expires_at']
-                display_url = original_url if original_url else url
                 now = datetime.now(timezone.utc)
 
                 # 1. Проверяем доступность
@@ -1047,8 +1240,8 @@ async def scheduled_check():
                     'last_check': now.isoformat()
                 }).eq('id', site_id).execute()
 
-                # 3. Отправляем уведомления о доступности и SSL
-                if status_changed:
+                # 3. Отправляем уведомления о доступности и SSL (только для нерезервных доменов)
+                if status_changed and not site.get('is_reserve_domain', False):
                     message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}" if status else f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}"
                     await send_notification(chat_id, message)
                 
@@ -1060,29 +1253,45 @@ async def scheduled_check():
                         message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!"
                     await send_notification(chat_id, message)
 
-                # 4. Проверяем даты домена и хостинга и отправляем уведомления
+                # --- НОВЫЙ БЛОК: Проверка дат домена и хостинга с кнопками ---
                 now_date = now.date()
-                notification_points = [30, 15, 7, 3, 1] # Дни для отправки уведомлений
+                
+                # Новая логика уведомлений
+                notification_schedule = {30, 14} # Конкретные дни для уведомлений
+                daily_start_day = 7 # Начиная с 7 дней, уведомляем каждый день
 
                 # Проверка домена
                 if site.get('domain_expires_at'):
                     domain_expiry_date = datetime.fromisoformat(site['domain_expires_at']).date()
                     days_left = (domain_expiry_date - now_date).days
-                    if days_left in notification_points:
-                        message = f"‼️ Напоминание: Срок оплаты домена для сайта {display_url} истекает через {days_left} дней ({domain_expiry_date.strftime('%d.%m.%Y')})!"
-                        await send_notification(chat_id, message)
+                    
+                    # Проверяем, наступил ли день для уведомления
+                    should_notify = (days_left in notification_schedule) or (0 <= days_left <= daily_start_day)
+
+                    if should_notify:
+                        message = f"‼️ **Домен:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({domain_expiry_date.strftime('%d.%m.%Y')})!"
+                        keyboard = get_renewal_keyboard(site['id'], "domain")
+                        # Отправляем уведомление с кнопками
+                        target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+                        await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
 
                 # Проверка хостинга
                 if site.get('hosting_expires_at'):
                     hosting_expiry_date = datetime.fromisoformat(site['hosting_expires_at']).date()
                     days_left = (hosting_expiry_date - now_date).days
-                    if days_left in notification_points:
-                        message = f"‼️ Напоминание: Срок оплаты хостинга для сайта {display_url} истекает через {days_left} дней ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
-                        await send_notification(chat_id, message)
+                    
+                    should_notify = (days_left in notification_schedule) or (0 <= days_left <= daily_start_day)
+
+                    if should_notify:
+                        message = f"🖥️ **Хостинг:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
+                        keyboard = get_renewal_keyboard(site['id'], "hosting")
+                        # Отправляем уведомление с кнопками
+                        target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+                        await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
 
         except Exception as e:
             logging.error(f"Error in scheduled check: {e}")
-            await send_admin_notification(f"Критическая ошибка в scheduled_check: {e}") # Уведомляем админа о сбое
+            await send_admin_notification(f"Критическая ошибка в scheduled_check: {e}")
         
         await asyncio.sleep(CHECK_INTERVAL)
 
