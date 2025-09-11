@@ -1,7 +1,6 @@
 import asyncio
 import aiohttp
 import logging
-import sqlite3
 import idna  # для работы с Punycode
 import ssl
 import socket
@@ -63,109 +62,6 @@ async def is_admin_in_chat(chat_id: int, user_id: int) -> bool:
         return False
 
 
-async def migrate_from_sqlite():
-    """Переносит данные из SQLite в Supabase и удаляет SQLite базу"""
-    sqlite_db_path = 'sites_monitor.db'
-    
-    # Проверяем существование SQLite базы
-    if not os.path.exists(sqlite_db_path):
-        logging.info("SQLite база данных не найдена. Миграция не требуется.")
-        return
-        
-    try:
-        # Подключаемся к SQLite
-        conn = sqlite3.connect(sqlite_db_path)
-        cursor = conn.cursor()
-        
-        # Проверяем структуру таблицы SQLite
-        cursor.execute("PRAGMA table_info(sites)")
-        columns_info = cursor.fetchall()
-        column_names = [col[1] for col in columns_info]
-        
-        # Формируем SELECT запрос в зависимости от структуры таблицы
-        if 'original_url' in column_names:
-            select_query = """
-                SELECT url, original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check 
-                FROM sites
-            """
-        else:
-            select_query = """
-                SELECT url, NULL as original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check 
-                FROM sites
-            """
-        
-        cursor.execute(select_query)
-        sites = cursor.fetchall()
-        conn.close()
-        
-        if not sites:
-            logging.info("Нет данных для миграции.")
-            os.remove(sqlite_db_path)
-            logging.info("Пустая SQLite база удалена.")
-            return
-            
-        # Переносим данные в Supabase
-        migrated_count = 0
-        for site_data in sites:
-            url, original_url, user_id, is_up, has_ssl, ssl_expires_at, last_check = site_data
-            
-            try:
-                # Проверяем, не существует ли уже такая запись в Supabase
-                existing = supabase.table('botmonitor_sites').select('id').eq('url', url).eq('chat_id', user_id).execute()
-                
-                if existing.data:
-                    logging.info(f"Сайт {url} для chat_id {user_id} уже существует в Supabase")
-                    continue
-                
-                # Подготавливаем данные для вставки
-                insert_data = {
-                    'url': url,
-                    'original_url': original_url,
-                    'user_id': user_id,
-                    'chat_id': user_id,  # Для старых записей chat_id = user_id (приватные чаты)
-                    'chat_type': 'private',  # Старые записи были из приватных чатов
-                    'is_up': bool(is_up) if is_up is not None else True,
-                    'has_ssl': bool(has_ssl) if has_ssl is not None else False,
-                    'ssl_expires_at': ssl_expires_at if ssl_expires_at else None,
-                    'last_check': last_check if last_check else None
-                }
-                
-                # Добавляем запись в Supabase
-                result = supabase.table('botmonitor_sites').insert(insert_data).execute()
-                
-                if result.data:
-                    migrated_count += 1
-                    logging.info(f"Перенесен сайт: {url}")
-                
-            except Exception as e:
-                logging.error(f"Ошибка переноса сайта {url}: {e}")
-                continue
-        
-        logging.info(f"Миграция завершена. Перенесено записей: {migrated_count}")
-        
-        # Создаем резервную копию перед удалением
-        backup_path = f'sites_monitor_backup_{datetime.now().strftime("%Y%m%d_%H%M%S")}.db'
-        import shutil
-        shutil.copy2(sqlite_db_path, backup_path)
-        logging.info(f"Создана резервная копия: {backup_path}")
-        
-        # Удаляем оригинальную SQLite базу
-        os.remove(sqlite_db_path)
-        logging.info("SQLite база данных успешно удалена после миграции.")
-        
-        # Уведомляем админа о завершении миграции
-        migration_message = f"✅ Миграция данных завершена!\n" \
-                          f"📊 Перенесено записей: {migrated_count}\n" \
-                          f"🗃️ Создана резервная копия: {backup_path}\n" \
-                          f"🗑️ SQLite база удалена\n" \
-                          f"⏰ Время: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}"
-        await send_admin_notification(migration_message)
-        
-    except Exception as e:
-        logging.error(f"Ошибка миграции данных: {e}")
-        error_message = f"❌ Ошибка миграции данных: {str(e)}\n" \
-                      f"SQLite база НЕ была удалена из-за ошибки."
-        await send_admin_notification(error_message)
 
 
 async def send_admin_notification(message: str):
@@ -703,8 +599,6 @@ async def on_startup():
 
 async def main():
     init_db()
-    # Автоматическая миграция при запуске, если есть SQLite база
-    await migrate_from_sqlite()
     
     # Получаем количество сайтов в базе данных
     sites_count = get_sites_count()
