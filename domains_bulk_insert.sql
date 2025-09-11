@@ -42,9 +42,12 @@ INSERT INTO botmonitor_sites (
 -- Домен без даты истечения домена и хостинга (бархат-новыйсвет.рф)
 ('https://бархат-новыйсвет.рф', 'бархат-новыйсвет.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, NULL, NULL, NOW(), NOW()),
 
--- Домены ТОЛЬКО с хостингом (vladograd.com, жкпредгорье.рф) - 02.07.2026 (296 дней с 11.09.2025)
+-- Домены ТОЛЬКО с хостингом - 02.07.2026 (296 дней с 11.09.2025)
 ('https://vladograd.com', 'vladograd.com', {USER_ID}, {CHAT_ID}, 'private', true, true, NULL, '2026-07-02', NOW(), NOW()),
-('https://жкпредгорье.рф', 'жкпредгорье.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, NULL, '2026-07-02', NOW(), NOW());
+('https://жкпредгорье.рф', 'жкпредгорье.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, NULL, '2026-07-02', NOW(), NOW()),
+
+-- Домен ТОЛЬКО с хостингом - 22.04.2026 (223 дня с 11.09.2025)
+('https://жигулинароща.рф', 'жигулинароща.рф', {USER_ID}, {CHAT_ID}, 'private', true, true, NULL, '2026-04-22', NOW(), NOW());
 
 -- Проверка добавленных записей
 SELECT 
