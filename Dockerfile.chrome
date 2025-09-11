@@ -1,4 +1,4 @@
-# Используем официальный Python образ
+# Альтернативный Dockerfile с системным Chrome
 FROM python:3.11-slim
 
 # Устанавливаем системные зависимости для Playwright и Chrome
@@ -47,6 +47,13 @@ RUN apt-get update && apt-get install -y \
     fonts-noto-cjk \
     && rm -rf /var/lib/apt/lists/*
 
+# Устанавливаем Google Chrome
+RUN wget -q -O - https://dl.google.com/linux/linux_signing_key.pub | apt-key add - && \
+    echo "deb [arch=amd64] http://dl.google.com/linux/chrome/deb/ stable main" >> /etc/apt/sources.list.d/google-chrome.list && \
+    apt-get update && \
+    apt-get install -y google-chrome-stable && \
+    rm -rf /var/lib/apt/lists/*
+
 # Устанавливаем рабочую директорию
 WORKDIR /app
 
@@ -56,7 +63,7 @@ COPY requirements.txt .
 # Устанавливаем Python зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем браузеры Playwright
+# Устанавливаем браузеры Playwright (как fallback)
 RUN playwright install chromium
 RUN playwright install-deps chromium
 

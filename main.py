@@ -168,16 +168,163 @@ async def check_ssl_certificate(url):
 
 async def take_screenshot(url: str) -> BytesIO:
     try:
+        logging.info(f"Starting screenshot for URL: {url}")
+        
         async with async_playwright() as p:
-            browser = await p.chromium.launch(headless=True)
-            page = await browser.new_page(viewport={'width': 1920, 'height': 1080})
-            await page.goto(url, wait_until='networkidle', timeout=30000)
-            screenshot = await page.screenshot(full_page=False, type='png')
+            # Запускаем браузер с опциями для контейнера
+            browser = await p.chromium.launch(
+                headless=True,
+                args=[
+                    '--no-sandbox',
+                    '--disable-setuid-sandbox',
+                    '--disable-dev-shm-usage',
+                    '--disable-accelerated-2d-canvas',
+                    '--no-first-run',
+                    '--no-zygote',
+                    '--disable-gpu',
+                    '--disable-web-security',
+                    '--disable-features=VizDisplayCompositor',
+                    '--disable-background-timer-throttling',
+                    '--disable-backgrounding-occluded-windows',
+                    '--disable-renderer-backgrounding',
+                    '--disable-blink-features=AutomationControlled',
+                    '--disable-extensions',
+                    '--disable-plugins',
+                    '--disable-images',
+                    '--disable-javascript-harmony-promises',
+                    '--disable-wake-on-wifi',
+                    '--disable-ipc-flooding-protection',
+                    '--enable-unsafe-swiftshader',
+                    '--single-process',  # Для контейнеров
+                    '--disable-software-rasterizer',
+                    '--run-all-compositor-stages-before-draw',
+                    '--disable-background-mode',
+                    '--disable-client-side-phishing-detection',
+                    '--disable-crash-reporter',
+                    '--disable-default-apps',
+                    '--disable-extensions',
+                    '--disable-hang-monitor',
+                    '--disable-infobars',
+                    '--disable-notifications',
+                    '--disable-popup-blocking',
+                    '--disable-prompt-on-repost',
+                    '--disable-sync',
+                    '--force-color-profile=srgb',
+                    '--metrics-recording-only',
+                    '--no-pings',
+                    '--password-store=basic',
+                    '--use-mock-keychain',
+                    '--disable-field-trial-config',
+                    '--disable-logging',
+                    '--disable-breakpad',
+                    '--disable-component-update',
+                    '--disable-domain-reliability',
+                    '--disable-background-sync',
+                    '--disable-shader-cache',
+                    '--max_old_space_size=256'
+                ]
+            )
+            
+            logging.info("Browser launched successfully")
+            
+            page = await browser.new_page(
+                viewport={'width': 1920, 'height': 1080},
+                java_script_enabled=True,
+                ignore_https_errors=True,
+                bypass_csp=True
+            )
+            
+            logging.info("Page created successfully")
+            
+            # Устанавливаем таймауты
+            page.set_default_timeout(30000)
+            page.set_default_navigation_timeout(30000)
+            
+            # Устанавливаем пользовательский агент
+            await page.set_extra_http_headers({
+                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
+                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
+                'Accept-Language': 'en-US,en;q=0.5',
+                'Accept-Encoding': 'gzip, deflate, br',
+                'Connection': 'keep-alive',
+                'Upgrade-Insecure-Requests': '1'
+            })
+            
+            # Загружаем страницу
+            try:
+                response = await page.goto(
+                    url, 
+                    wait_until='domcontentloaded',
+                    timeout=25000
+                )
+                
+                if response:
+                    logging.info(f"Page loaded with status: {response.status}")
+                else:
+                    logging.warning(f"No response received for {url}")
+                    
+            except Exception as nav_error:
+                logging.warning(f"Navigation warning for {url}: {nav_error}")
+            
+            # Ждем для рендеринга
+            await page.wait_for_timeout(3000)
+            
+            # Делаем скриншот
+            screenshot = await page.screenshot(
+                full_page=False,
+                type='png',
+                timeout=15000,
+                animations='disabled',
+                caret='hide'
+            )
+            
+            logging.info(f"Screenshot captured successfully for {url}")
             await browser.close()
             return BytesIO(screenshot)
+            
     except Exception as e:
-        logging.error(f"Error taking screenshot: {e}")
+        logging.error(f"Error in take_screenshot for {url}: {str(e)}")
+        logging.error(f"Error type: {type(e).__name__}")
+        
+        # Дополнительная отладочная информация
+        if hasattr(e, 'args'):
+            logging.error(f"Error args: {e.args}")
+            
         return None
+
+
+async def diagnose_playwright():
+    """Диагностическая функция для проверки работы Playwright в контейнере"""
+    try:
+        logging.info("Starting Playwright diagnosis...")
+        
+        async with async_playwright() as p:
+            # Проверяем доступные браузеры
+            browsers = await p.chromium.launch(
+                headless=True,
+                args=['--no-sandbox', '--disable-setuid-sandbox']
+            )
+            version = await browsers.version()
+            await browsers.close()
+            
+            logging.info(f"Chromium version: {version}")
+            logging.info(f"Playwright browsers path: {os.environ.get('PLAYWRIGHT_BROWSERS_PATH', 'Not set')}")
+            
+            # Проверяем наличие файлов браузера
+            browsers_path = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/home/app/.cache/ms-playwright-chromium')
+            if os.path.exists(browsers_path):
+                logging.info(f"Browsers directory exists: {browsers_path}")
+                for root, dirs, files in os.walk(browsers_path):
+                    for file in files:
+                        if file.endswith('.sh') or file.endswith('chrome'):
+                            logging.info(f"Found browser file: {os.path.join(root, file)}")
+            else:
+                logging.error(f"Browsers directory not found: {browsers_path}")
+            
+            return True
+    except Exception as e:
+        logging.error(f"Playwright diagnosis failed: {e}")
+        return False
 
 
 # Настройка базы данных
@@ -202,7 +349,8 @@ async def cmd_start(message: Message):
         "/remove - удалить сайт из мониторинга\n"
         "/status - проверить статус всех сайтов\n"
         "/help - показать справку\n"
-        "/screenshot ID - сделать скриншот сайта"
+        "/screenshot ID - сделать скриншот сайта\n"
+        "/diagnose - диагностика Playwright"
     )
 
 
@@ -216,7 +364,8 @@ async def cmd_help(message: Message):
         "/remove - удалить сайт из мониторинга\n"
         "/status - выполнить проверку статуса всех сайтов\n"
         "/help - показать эту справку\n"
-        "/screenshot ID - сделать скриншот сайта\n\n"
+        "/screenshot ID - сделать скриншот сайта\n"
+        "/diagnose - диагностика Playwright\n\n"
         "Бот автоматически проверяет доступность сайтов каждые 5 минут.\n"
         "Вы можете добавлять сайты с кириллическими доменами (например, цифровизируем.рф).\n"
         "Протокол (http:// или https://) добавляется автоматически, если не указан.\n"
@@ -496,6 +645,42 @@ async def cmd_screenshot(message: Message):
         await bot.edit_message_text("Ошибка создания скриншота", message.chat.id, msg.message_id)
 
 
+@dp.message(Command("diagnose"))
+async def cmd_diagnose(message: Message):
+    """Команда диагностики Playwright"""
+    # Проверка прав для групп
+    if message.chat.type in ['group', 'supergroup']:
+        if not await is_admin_in_chat(message.chat.id, message.from_user.id):
+            await message.answer("Только администраторы могут запускать диагностику в группе.")
+            return
+    
+    msg = await message.answer("🔍 Запускаю диагностику Playwright...")
+    
+    try:
+        result = await diagnose_playwright()
+        
+        if result:
+            await bot.edit_message_text(
+                "✅ Диагностика Playwright завершена успешно!\n"
+                "Проверьте логи для подробной информации.",
+                chat_id=message.chat.id,
+                message_id=msg.message_id
+            )
+        else:
+            await bot.edit_message_text(
+                "❌ Диагностика Playwright завершилась с ошибками!\n"
+                "Проверьте логи для подробной информации.",
+                chat_id=message.chat.id,
+                message_id=msg.message_id
+            )
+    except Exception as e:
+        await bot.edit_message_text(
+            f"❌ Ошибка при выполнении диагностики: {str(e)}",
+            chat_id=message.chat.id,
+            message_id=msg.message_id
+        )
+
+
 # Функция проверки доступности сайта
 async def check_site(url):
     try:
@@ -605,11 +790,16 @@ async def main():
     # Получаем количество сайтов в базе данных
     sites_count = get_sites_count()
     
+    # Запускаем диагностику Playwright при старте
+    logging.info("Running Playwright diagnosis on startup...")
+    playwright_ok = await diagnose_playwright()
+    
     # Отправляем уведомление админу о запуске
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
                      f"⏰ Время запуска: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n" \
                      f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
-                     f"📊 Сайтов в базе проверки: {sites_count}"
+                     f"📊 Сайтов в базе проверки: {sites_count}\n" \
+                     f"🎭 Playwright: {'✅ OK' if playwright_ok else '❌ Ошибка'}"
     await send_admin_notification(startup_message)
     
     # Запускаем задачу проверки сайтов при старте
