@@ -747,10 +747,10 @@ async def handle_group_mention(message: Message):
             await safe_reply_message(message, "📝 В этом чате нет сайтов для мониторинга. Добавьте сайт командой /add")
             return
             
-        msg = await safe_reply_message(message, "🔄 Вы запросили статус всех сайтов. Начинаю проверку...")
-        if not msg:
-            return
-            
+        # 1. СРАЗУ ОТПРАВЛЯЕМ ПРЕДВАРИТЕЛЬНЫЙ ОТВЕТ
+        msg = await message.reply("🔄 Вы запросили статус всех сайтов. Начинаю проверку...")
+        
+        # 2. ВЫПОЛНЯЕМ ПРОВЕРКИ (МОЖЕТ ЗАНЯТЬ ВРЕМЯ)
         results = []
         for site_id, url, original_url in sites:
             display_url = original_url if original_url else url
@@ -785,8 +785,9 @@ async def handle_group_mention(message: Message):
                 'last_check': datetime.now(timezone.utc).isoformat()
             }).eq('id', site_id).execute()
             
+        # 3. ЗАМЕНЯЕМ ИСХОДНОЕ СООБЩЕНИЕ ИТОГОВЫМ РЕЗУЛЬТАТОМ
         response = "📊 **Результаты проверки сайтов в этом чате:**\n\n" + "\n\n".join(results)
-        await safe_send_message(message.chat.id, response, parse_mode="Markdown")
+        await bot.edit_message_text(response, chat_id=message.chat.id, message_id=msg.message_id, parse_mode="Markdown")
 
 
 # Функция проверки доступности сайта
