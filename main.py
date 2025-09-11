@@ -6,7 +6,7 @@ import ssl
 import socket
 import OpenSSL
 import os
-from datetime import datetime, timedelta
+from datetime import datetime, timedelta, timezone
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.storage.memory import MemoryStorage
 from aiogram.fsm.context import FSMContext
@@ -145,7 +145,7 @@ async def check_ssl_certificate(url):
                     subject = dict(x509.get_subject().get_components())
                     subject_name = subject.get(b'CN', b'Unknown').decode('utf-8')
 
-                    days_left = (expiry_date - datetime.now()).days
+                    days_left = (expiry_date - datetime.now(timezone.utc)).days
 
                     return {
                         'has_ssl': True,
@@ -294,7 +294,7 @@ async def process_url_input(message: Message, state: FSMContext):
         'is_up': is_up,
         'has_ssl': has_ssl,
         'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
-        'last_check': datetime.now().isoformat()
+        'last_check': datetime.now(timezone.utc).isoformat()
     }).execute()
 
     # Если URL был преобразован, показываем пользователю информацию о конвертации
@@ -340,7 +340,7 @@ async def cmd_list(message: Message):
         # Добавляем информацию о SSL сертификате
         if has_ssl and ssl_expires_at:
             expiry_date = datetime.fromisoformat(ssl_expires_at.replace('Z', '+00:00'))
-            days_left = (expiry_date - datetime.now()).days
+            days_left = (expiry_date - datetime.now(timezone.utc)).days
             if days_left <= 0:
                 ssl_status = "⚠️ SSL сертификат ИСТЁК!"
             elif days_left <= SSL_WARNING_DAYS:
@@ -450,7 +450,7 @@ async def cmd_status(message: Message):
             'is_up': status,
             'has_ssl': has_ssl,
             'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
-            'last_check': datetime.now().isoformat()
+            'last_check': datetime.now(timezone.utc).isoformat()
         }).eq('id', site_id).execute()
 
     response = "📊 Результаты проверки:\n\n" + "\n\n".join(results)
@@ -513,7 +513,7 @@ async def scheduled_check():
 
             for site_id, url, original_url, user_id, chat_id, was_up, had_ssl, old_ssl_expires_at in sites:
                 display_url = original_url if original_url else url
-                now = datetime.now()
+                now = datetime.now(timezone.utc)
 
                 # Проверяем доступность
                 status, status_code = await check_site(url)
@@ -605,7 +605,7 @@ async def main():
     
     # Отправляем уведомление админу о запуске
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
-                     f"⏰ Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
+                     f"⏰ Время запуска: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n" \
                      f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
                      f"📊 Сайтов в базе проверки: {sites_count}"
     await send_admin_notification(startup_message)
