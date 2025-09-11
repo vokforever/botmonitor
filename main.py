@@ -140,6 +140,8 @@ async def check_ssl_certificate(url):
 
                     # Получаем срок действия сертификата
                     expiry_date = datetime.strptime(x509.get_notAfter().decode('ascii'), '%Y%m%d%H%M%SZ')
+                    # FIX: Make expiry_date timezone-aware (UTC)
+                    expiry_date = expiry_date.replace(tzinfo=timezone.utc)
                     issuer = dict(x509.get_issuer().get_components())
                     issuer_name = issuer.get(b'CN', b'Unknown').decode('utf-8')
                     subject = dict(x509.get_subject().get_components())
