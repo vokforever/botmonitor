@@ -151,9 +151,9 @@ async def safe_reply_message(message: Message, text: str, parse_mode: str = None
 
 
 def get_sites_count():
-    """Возвращает количество сайтов в базе данных"""
+    """Возвращает количество сайтов в базе данных (исключая резервные домены)"""
     try:
-        result = supabase.table('botmonitor_sites').select('id', count='exact').execute()
+        result = supabase.table('botmonitor_sites').select('id', count='exact').eq('is_reserve_domain', False).execute()
         return result.count
     except Exception as e:
         logging.error(f"Ошибка получения количества сайтов: {e}")
