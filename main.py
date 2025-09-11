@@ -57,7 +57,7 @@ dp = Dispatcher(storage=storage)
 
 # Интервал проверки в секундах
 CHECK_INTERVAL = 300  # 5 минут
-SSL_WARNING_DAYS = 30  # Предупреждение о сроке истечения SSL сертификата (в днях)
+SSL_WARNING_DAYS = 30  # Предупреждение о сроке истечения SSL сертификата (в днях) - используется для отображения в списке
 
 
 
@@ -1202,7 +1202,7 @@ async def scheduled_check():
     while True:
         try:
             sites_data = supabase.table('botmonitor_sites').select(
-                'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, is_reserve_domain'
+                'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, is_reserve_domain, ssl_last_notification_day'
             ).execute()
             sites = sites_data.data
 
@@ -1227,18 +1227,32 @@ async def scheduled_check():
                     ssl_changed = has_ssl != bool(had_ssl)
                     if has_ssl:
                         ssl_expires_at = ssl_info.get('expiry_date')
-                        # Проверяем, нужно ли отправить предупреждение
-                        if ssl_info.get('expires_soon') or ssl_info.get('expired'):
+                        # Проверяем, нужно ли отправить предупреждение по новой схеме
+                        # Уведомления отправляются только в дни: 30, 14, 7, 6, 5, 4, 3, 2, 1 и при истечении
+                        days_left = ssl_info.get('days_left', 0)
+                        ssl_notification_days = {30, 14, 7, 6, 5, 4, 3, 2, 1}
+                        if days_left in ssl_notification_days or days_left <= 0:
+                            # Проверяем, что это новая дата истечения или изменилось количество дней
                             if not old_ssl_expires_at or (ssl_expires_at and str(ssl_expires_at) != old_ssl_expires_at):
-                                ssl_warning = True
+                                # Проверяем, не отправляли ли уже уведомление сегодня для этого количества дней
+                                last_notification_day = site.get('ssl_last_notification_day')
+                                today = now.date()
+                                if last_notification_day != today or last_notification_day is None:
+                                    ssl_warning = True
 
                 # Обновляем статус в БД
-                supabase.table('botmonitor_sites').update({
+                update_data = {
                     'is_up': status,
                     'has_ssl': has_ssl,
                     'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at and hasattr(ssl_expires_at, 'isoformat') else ssl_expires_at,
                     'last_check': now.isoformat()
-                }).eq('id', site_id).execute()
+                }
+                
+                # Если отправляем SSL уведомление, обновляем дату последнего уведомления
+                if ssl_warning and has_ssl:
+                    update_data['ssl_last_notification_day'] = now.date().isoformat()
+                
+                supabase.table('botmonitor_sites').update(update_data).eq('id', site_id).execute()
 
                 # 3. Отправляем уведомления о доступности и SSL (только для нерезервных доменов)
                 if status_changed and not site.get('is_reserve_domain', False):
@@ -1251,7 +1265,8 @@ async def scheduled_check():
                         message = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
                     else:
                         message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!"
-                    await send_notification(chat_id, message)
+                    # SSL уведомления отправляем только админу
+                    await send_admin_notification(f"🔔 Уведомление для чата ID: {chat_id}\n\n{message}")
 
                 # --- НОВЫЙ БЛОК: Проверка дат домена и хостинга с кнопками ---
                 now_date = now.date()
