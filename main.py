@@ -603,6 +603,84 @@ async def cmd_diagnose(message: Message):
         )
 
 
+# Обработчик упоминаний бота в группах
+@dp.message(F.chat.type.in_(['group', 'supergroup']), F.text)
+async def handle_group_mention(message: Message):
+    # Check if the message mentions the bot
+    bot_username = (await bot.get_me()).username
+    if f"@{bot_username}" not in message.text:
+        return
+    
+    # Extract the domain from the message
+    text_parts = message.text.split()
+    domain = None
+    
+    # Look for a domain in the message parts
+    for part in text_parts:
+        if part.startswith("@") and part != f"@{bot_username}":
+            # Skip if it's another username
+            continue
+        if "." in part and not part.startswith("@"):
+            # This looks like a domain
+            domain = part
+            break
+    
+    if not domain:
+        await message.answer("Пожалуйста, укажите домен после упоминания бота. Например: @monitoring_saitov_digital_rf_bot vladograd.com")
+        return
+    
+    # Process the URL to ensure it has a protocol and convert IDN if needed
+    url = process_url(domain)
+    
+    # Check if this domain exists in the database for this chat
+    site_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+    
+    found_site = None
+    for site in site_data.data:
+        # Check if the domain matches either the original URL or processed URL
+        if domain in site['original_url'] or domain in site['url']:
+            found_site = site
+            break
+    
+    if not found_site:
+        await message.answer(f"Сайт {domain} не найден в списке отслеживаемых для этого чата.")
+        return
+    
+    # Format the response with site information
+    site_id = found_site['id']
+    site_url = found_site['url']
+    original_url = found_site['original_url']
+    is_up = found_site['is_up']
+    has_ssl = found_site['has_ssl']
+    ssl_expires_at = found_site['ssl_expires_at']
+    last_check = found_site['last_check']
+    
+    # Use original URL for display if available
+    display_url = original_url if original_url else site_url
+    status = "✅ доступен" if is_up else "❌ недоступен"
+    last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check.replace('Z', '+00:00')).strftime("%d.%m.%Y %H:%M:%S")
+    
+    response = f"Информация о сайте:\nID: {site_id}\nURL: {display_url}\nСтатус: {status}\n"
+    
+    # Add SSL certificate information
+    if has_ssl and ssl_expires_at:
+        expiry_date = datetime.fromisoformat(ssl_expires_at.replace('Z', '+00:00'))
+        days_left = (expiry_date - datetime.now(timezone.utc)).days
+        if days_left <= 0:
+            ssl_status = "⚠️ SSL сертификат ИСТЁК!"
+        elif days_left <= SSL_WARNING_DAYS:
+            ssl_status = f"⚠️ SSL сертификат истекает через {days_left} дней"
+        else:
+            ssl_status = f"SSL действителен ещё {days_left} дней"
+        response += f"{ssl_status}\n"
+    elif site_url.startswith('https://'):
+        response += "❌ SSL сертификат не проверен\n"
+    
+    response += f"Последняя проверка: {last_check_str}"
+    
+    await message.answer(response)
+
+
 # Функция проверки доступности сайта
 async def check_site(url):
     try:
