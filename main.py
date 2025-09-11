@@ -326,20 +326,28 @@ async def cmd_start(message: Message):
 # Обработчик команды /help
 @dp.message(Command("help"))
 async def cmd_help(message: Message):
-    await message.answer(
-        "ℹ️ Справка по командам:\n\n"
-        "/add - добавить новый сайт для мониторинга\n"
-        "/list - показать список всех отслеживаемых вами сайтов\n"
-        "/remove - удалить сайт из мониторинга\n"
-        "/status - выполнить проверку статуса всех сайтов\n"
-        "/help - показать эту справку\n"
-        "/screenshot ID - сделать скриншот сайта\n"
-        "/diagnose - диагностика ScreenshotMachine API\n\n"
-        "Бот автоматически проверяет доступность сайтов каждые 5 минут.\n"
-        "Вы можете добавлять сайты с кириллическими доменами (например, цифровизируем.рф).\n"
-        "Протокол (http:// или https://) добавляется автоматически, если не указан.\n"
-        "Для HTTPS сайтов дополнительно проверяется SSL сертификат и срок его действия."
-    )
+    help_text = "ℹ️ Справка по командам:\n\n"
+    
+    if message.chat.type in ['group', 'supergroup']:
+        help_text += "**В группах:**\n"
+        help_text += "@бот - показать статус всех сайтов в этом чате\n"
+        help_text += "@бот домен.com - показать информацию о конкретном сайте\n\n"
+    
+    help_text += "**Команды:**\n"
+    help_text += "/add [URL] - добавить новый сайт для мониторинга\n"
+    help_text += "/list - показать список всех отслеживаемых сайтов\n"
+    help_text += "/remove [ID] - удалить сайт из мониторинга\n"
+    help_text += "/status - выполнить проверку статуса всех сайтов\n"
+    help_text += "/screenshot [ID] - сделать скриншот сайта\n"
+    help_text += "/diagnose - диагностика ScreenshotMachine API\n"
+    help_text += "/help - показать эту справку\n\n"
+    help_text += "**Особенности:**\n"
+    help_text += "• Бот автоматически проверяет сайты каждые 5 минут\n"
+    help_text += "• Поддержка кириллических доменов (цифровизируем.рф)\n"
+    help_text += "• Автоматическое добавление протокола http:// или https://\n"
+    help_text += "• Проверка SSL сертификатов для HTTPS сайтов"
+    
+    await message.answer(help_text, parse_mode="Markdown")
 
 
 # Обработчик команды /add
@@ -663,10 +671,6 @@ async def cmd_diagnose(message: Message):
 # Обработчик упоминаний бота в группах
 @dp.message(F.chat.type.in_(['group', 'supergroup']), F.text)
 async def handle_group_mention(message: Message):
-    # --- НАЧАЛО ДИАГНОСТИКИ ---
-    logging.info(f"Получено сообщение в группе: '{message.text}'")
-    # --- КОНЕЦ ДИАГНОСТИКИ ---
-
     # Проверяем, есть ли в сообщении упоминание бота
     bot_info = await bot.get_me()
     bot_username = bot_info.username
@@ -674,81 +678,115 @@ async def handle_group_mention(message: Message):
         # Это обычное сообщение, не для нашего бота, просто выходим
         return
 
-    # --- НАЧАЛО ДИАГНОСТИКИ ---
-    logging.info(f"Сообщение содержит упоминание бота @{bot_username}")
-    # --- КОНЕЦ ДИАГНОСТИКИ ---
-
-    # Извлекаем домен из сообщения. Более надежный способ.
+    # Извлекаем домен из сообщения.
     # Удаляем упоминание бота и лишние пробелы
     cleaned_text = message.text.replace(f"@{bot_username}", "").strip()
     # Первое слово после упоминания считаем доменом
-    domain = cleaned_text.split()[0] if cleaned_text else None
+    domain = cleaned_text.split()[0] if cleaned_text and '.' in cleaned_text.split()[0] else None
 
-    if not domain:
-        logging.warning("Домен не найден после упоминания.")
-        await safe_reply_message(message, "Пожалуйста, укажите домен после упоминания бота. Например: @monitoring_saitov_digital_rf_bot vladograd.com")
-        return
-    
-    # --- НАЧАЛО ДИАГНОСТИКИ ---
-    logging.info(f"Извлечен домен: {domain}")
-    # --- КОНЕЦ ДИАГНОСТИКИ ---
+    # --- НОВАЯ ЛОГИКА ---
+    # Если домен указан, ищем информацию по конкретному сайту
+    if domain:
+        logging.info(f"Получен запрос для конкретного домена: {domain}")
+        # Ищем этот сайт в базе данных для текущего чата
+        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+        
+        found_site = None
+        for site in sites_data.data:
+            # Проверяем совпадение с оригинальным или обработанным URL
+            if domain in site.get('original_url', '') or domain in site.get('url', ''):
+                found_site = site
+                break
+                
+        if not found_site:
+            await safe_reply_message(message, f"Сайт {domain} не найден в списке отслеживаемых для этого чата.")
+            return
 
-    # Обрабатываем URL для преобразования в punycode и добавления протокола
-    url = process_url(domain)
-    
-    # Ищем этот сайт в базе данных для текущего чата
-    site_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check').eq('chat_id', message.chat.id).execute()
-    
-    found_site = None
-    for site in site_data.data:
-        # Проверяем совпадение с оригинальным или обработанным URL
-        if domain in site.get('original_url', '') or domain in site.get('url', ''):
-            found_site = site
-            break
+        # Формируем ответ с информацией о сайте
+        site_id = found_site['id']
+        site_url = found_site['url']
+        original_url = found_site['original_url']
+        is_up = found_site['is_up']
+        has_ssl = found_site['has_ssl']
+        ssl_expires_at = found_site['ssl_expires_at']
+        last_check = found_site['last_check']
+        
+        display_url = original_url if original_url else site_url
+        status = "✅ доступен" if is_up else "❌ недоступен"
+        last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check.replace('Z', '+00:00')).strftime("%d.%m.%Y %H:%M:%S")
+        
+        response_text = f"📊 **Информация о сайте:**\n\n" \
+                        f"**ID:** `{site_id}`\n" \
+                        f"**URL:** {display_url}\n" \
+                        f"**Статус:** {status}\n"
+        
+        if has_ssl and ssl_expires_at:
+            expiry_date = datetime.fromisoformat(ssl_expires_at.replace('Z', '+00:00'))
+            days_left = (expiry_date - datetime.now(timezone.utc)).days
+            if days_left <= 0:
+                ssl_status = "⚠️ **SSL сертификат ИСТЁК!**"
+            elif days_left <= SSL_WARNING_DAYS:
+                ssl_status = f"⚠️ SSL сертификат истекает через {days_left} дней"
+            else:
+                ssl_status = f"✅ SSL действителен ещё {days_left} дней"
+            response_text += f"**SSL:** {ssl_status}\n"
+        elif site_url.startswith('https://'):
+            response_text += "**SSL:** ❌ Сертификат не найден или недействителен\n"
+        
+        response_text += f"**Последняя проверка:** {last_check_str}"
+        
+        await safe_reply_message(message, response_text, parse_mode="Markdown")
+
+    # Если домен НЕ указан, показываем статус всех сайтов в чате
+    else:
+        logging.info(f"Получен запрос на статус всех сайтов для чата {message.chat.id}")
+        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url').eq('chat_id', message.chat.id).execute()
+        sites = [(s['id'], s['url'], s['original_url']) for s in sites_data.data]
+        
+        if not sites:
+            await safe_reply_message(message, "📝 В этом чате нет сайтов для мониторинга. Добавьте сайт командой /add")
+            return
             
-    if not found_site:
-        logging.info(f"Сайт '{domain}' не найден в базе для чата {message.chat.id}")
-        await safe_reply_message(message, f"Сайт {domain} не найден в списке отслеживаемых для этого чата.")
-        return
-    
-    # --- НАЧАЛО ДИАГНОСТИКИ ---
-    logging.info(f"Найден сайт в базе: {found_site}")
-    # --- КОНЕЦ ДИАГНОСТИКИ ---
+        msg = await safe_reply_message(message, "🔄 Вы запросили статус всех сайтов. Начинаю проверку...")
+        if not msg:
+            return
+            
+        results = []
+        for site_id, url, original_url in sites:
+            display_url = original_url if original_url else url
+            status, status_code = await check_site(url)
+            status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code})"
+            site_info = f"**URL:** {display_url}\n**Статус:** {status_str}"
 
-    # Формируем ответ с информацией о сайте
-    site_id = found_site['id']
-    site_url = found_site['url']
-    original_url = found_site['original_url']
-    is_up = found_site['is_up']
-    has_ssl = found_site['has_ssl']
-    ssl_expires_at = found_site['ssl_expires_at']
-    last_check = found_site['last_check']
-    
-    display_url = original_url if original_url else site_url
-    status = "✅ доступен" if is_up else "❌ недоступен"
-    last_check_str = "Еще не проверялся" if not last_check else datetime.fromisoformat(last_check.replace('Z', '+00:00')).strftime("%d.%m.%Y %H:%M:%S")
-    
-    response_text = f"📊 **Информация о сайте:**\n\n" \
-                    f"**ID:** `{site_id}`\n" \
-                    f"**URL:** {display_url}\n" \
-                    f"**Статус:** {status}\n"
-    
-    if has_ssl and ssl_expires_at:
-        expiry_date = datetime.fromisoformat(ssl_expires_at.replace('Z', '+00:00'))
-        days_left = (expiry_date - datetime.now(timezone.utc)).days
-        if days_left <= 0:
-            ssl_status = "⚠️ **SSL сертификат ИСТЁК!**"
-        elif days_left <= SSL_WARNING_DAYS:
-            ssl_status = f"⚠️ SSL сертификат истекает через {days_left} дней"
-        else:
-            ssl_status = f"✅ SSL действителен ещё {days_left} дней"
-        response_text += f"**SSL:** {ssl_status}\n"
-    elif site_url.startswith('https://'):
-        response_text += "**SSL:** ❌ Сертификат не найден или недействителен\n"
-    
-    response_text += f"**Последняя проверка:** {last_check_str}"
-    
-    await safe_reply_message(message, response_text, parse_mode="Markdown")
+            ssl_expires_at = None
+            has_ssl = False
+            if status and url.startswith('https://'):
+                ssl_info = await check_ssl_certificate(url)
+                has_ssl = ssl_info.get('has_ssl', False)
+                if has_ssl:
+                    expiry_date = ssl_info.get('expiry_date')
+                    days_left = ssl_info.get('days_left')
+                    if ssl_info.get('expired'):
+                        site_info += f"\n**SSL:** ⚠️ **ИСТЁК!**"
+                    elif ssl_info.get('expires_soon'):
+                        site_info += f"\n**SSL:** ⚠️ истекает через {days_left} дней!"
+                    else:
+                        site_info += f"\n**SSL:** ✅ действителен ещё {days_left} дней"
+                    ssl_expires_at = expiry_date
+                else:
+                    site_info += "\n**SSL:** ❌ не найден или недействителен"
+            results.append(site_info)
+            
+            # Обновляем статус в БД
+            supabase.table('botmonitor_sites').update({
+                'is_up': status,
+                'has_ssl': has_ssl,
+                'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
+                'last_check': datetime.now(timezone.utc).isoformat()
+            }).eq('id', site_id).execute()
+            
+        response = "📊 **Результаты проверки сайтов в этом чате:**\n\n" + "\n\n".join(results)
+        await safe_send_message(message.chat.id, response, parse_mode="Markdown")
 
 
 # Функция проверки доступности сайта
