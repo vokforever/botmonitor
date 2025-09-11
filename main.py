@@ -380,7 +380,7 @@ async def cmd_start(message: Message):
         "/sethosting ID - установить дату истечения хостинга\n"
         "/myid - показать ваш User ID и Chat ID\n"
         "/help - показать справку\n"
-        "/screenshot ID - сделать скриншот сайта\n"
+        "/screenshot ID/URL - сделать скриншот сайта\n"
         "/diagnose - диагностика ScreenshotMachine API"
     )
 
@@ -408,7 +408,7 @@ async def cmd_help(message: Message):
     help_text += "/setdomain [ID] - установить дату истечения домена\n"
     help_text += "/sethosting [ID] - установить дату истечения хостинга\n"
     help_text += "/myid - показать ваш User ID и Chat ID\n"
-    help_text += "/screenshot [ID] - сделать скриншот сайта\n"
+    help_text += "/screenshot [ID/URL] - сделать скриншот сайта\n"
     help_text += "/diagnose - диагностика ScreenshotMachine API\n"
     help_text += "/help - показать эту справку\n\n"
     help_text += "**Особенности:**\n"
@@ -745,24 +745,31 @@ async def cmd_status(message: Message):
 async def cmd_screenshot(message: Message):
     command_parts = message.text.split(maxsplit=1)
     if len(command_parts) < 2:
-        await message.answer("Укажите ID сайта: /screenshot ID")
+        await message.answer("Укажите ID сайта или URL: /screenshot ID или /screenshot URL")
         return
     
+    argument = command_parts[1].strip()
+    
+    # Проверяем, является ли аргумент числом (ID)
     try:
-        site_id = int(command_parts[1])
+        site_id = int(argument)
+        # Это ID - ищем сайт в базе данных
+        site_data = supabase.table('botmonitor_sites').select('url, original_url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+        site = (site_data.data[0]['url'], site_data.data[0]['original_url']) if site_data.data else None
+        
+        if not site:
+            await message.answer(f"Сайт с ID {site_id} не найден в этом чате.")
+            return
+            
+        url, original_url = site
+        display_url = original_url if original_url else url
+        filename_suffix = f"id_{site_id}"
+        
     except ValueError:
-        await message.answer("ID должен быть числом.")
-        return
-        
-    site_data = supabase.table('botmonitor_sites').select('url, original_url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
-    site = (site_data.data[0]['url'], site_data.data[0]['original_url']) if site_data.data else None
-    
-    if not site:
-        await message.answer(f"Сайт с ID {site_id} не найден в этом чате.")
-        return
-        
-    url, original_url = site
-    display_url = original_url if original_url else url
+        # Это не число - считаем это URL
+        url = process_url(argument)
+        display_url = argument  # Показываем оригинальный URL пользователю
+        filename_suffix = "url_" + argument.replace("://", "_").replace("/", "_").replace(".", "_")
     
     msg = await message.answer(f"Создаю скриншот для {display_url}...")
     
@@ -771,7 +778,7 @@ async def cmd_screenshot(message: Message):
     if screenshot:
         await bot.send_photo(
             chat_id=message.chat.id,
-            photo=types.BufferedInputFile(screenshot.getvalue(), filename=f"screenshot_{site_id}.png"),
+            photo=types.BufferedInputFile(screenshot.getvalue(), filename=f"screenshot_{filename_suffix}.png"),
             caption=f"Скриншот сайта: {display_url}"
         )
         await bot.delete_message(message.chat.id, msg.message_id)
