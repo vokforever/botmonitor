@@ -33,6 +33,10 @@ ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
 if not ADMIN_CHAT_ID:
     raise ValueError("ADMIN_CHAT_ID не найден в переменных окружения. Создайте .env файл с ADMIN_CHAT_ID=your_chat_id")
 
+# Новая переменная для управления уведомлениями
+# os.getenv вернет строку 'True' или 'False', сравниваем ее
+ONLY_ADMIN_PUSH = os.getenv('ONLY_ADMIN_PUSH') == 'True'
+
 SUPABASE_URL = os.getenv('SUPABASE_URL')
 SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 if not SUPABASE_URL or not SUPABASE_KEY:
@@ -75,6 +79,26 @@ async def send_admin_notification(message: str):
         logging.info(f"Уведомление отправлено админу: {message}")
     except Exception as e:
         logging.error(f"Ошибка отправки уведомления админу: {e}")
+
+async def send_notification(chat_id: int, text: str):
+    """
+    Отправляет уведомление либо в исходный чат, либо админу,
+    в зависимости от настройки ONLY_ADMIN_PUSH.
+    """
+    target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+    
+    # Если отправляем админу, добавим информацию об исходном чате для ясности
+    if ONLY_ADMIN_PUSH and str(chat_id) != str(ADMIN_CHAT_ID):
+         notification_text = f"🔔 Уведомление для чата ID: {chat_id}\n\n{text}"
+    else:
+         # Если отправляем в тот же чат, дополнительная информация не нужна
+         notification_text = text
+
+    try:
+        await bot.send_message(chat_id=target_chat_id, text=notification_text)
+        logging.info(f"Уведомление отправлено в чат {target_chat_id}")
+    except Exception as e:
+        logging.error(f"Ошибка отправки уведомления в чат {target_chat_id}: {e}")
 
 async def safe_send_message(chat_id: int, text: str, parse_mode: str = None, max_retries: int = 3):
     """Безопасная отправка сообщения с retry механизмом"""
@@ -306,6 +330,11 @@ def init_db():
 class AddSite(StatesGroup):
     waiting_for_url = State()
 
+# Состояния для установки дат истечения
+class SetExpiration(StatesGroup):
+    waiting_for_domain_date = State()
+    waiting_for_hosting_date = State()
+
 
 # Обработчик команды /start
 @dp.message(Command("start"))
@@ -317,6 +346,8 @@ async def cmd_start(message: Message):
         "/list - показать список отслеживаемых сайтов\n"
         "/remove - удалить сайт из мониторинга\n"
         "/status - проверить статус всех сайтов\n"
+        "/setdomain ID - установить дату истечения домена\n"
+        "/sethosting ID - установить дату истечения хостинга\n"
         "/help - показать справку\n"
         "/screenshot ID - сделать скриншот сайта\n"
         "/diagnose - диагностика ScreenshotMachine API"
@@ -338,6 +369,8 @@ async def cmd_help(message: Message):
     help_text += "/list - показать список всех отслеживаемых сайтов\n"
     help_text += "/remove [ID] - удалить сайт из мониторинга\n"
     help_text += "/status - выполнить проверку статуса всех сайтов\n"
+    help_text += "/setdomain [ID] - установить дату истечения домена\n"
+    help_text += "/sethosting [ID] - установить дату истечения хостинга\n"
     help_text += "/screenshot [ID] - сделать скриншот сайта\n"
     help_text += "/diagnose - диагностика ScreenshotMachine API\n"
     help_text += "/help - показать эту справку\n\n"
@@ -457,15 +490,25 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
 # Обработчик команды /list
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check').eq('chat_id', message.chat.id).execute()
-    sites = [(s['id'], s['url'], s['original_url'], s['is_up'], s['has_ssl'], s['ssl_expires_at'], s['last_check']) for s in sites_data.data]
+    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+    sites = sites_data.data
 
     if not sites:
         await message.answer("📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
         return
 
     response = "📝 Список отслеживаемых сайтов:\n\n"
-    for site_id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check in sites:
+    for site in sites:
+        site_id = site['id']
+        url = site['url']
+        original_url = site['original_url']
+        is_up = site['is_up']
+        has_ssl = site['has_ssl']
+        ssl_expires_at = site['ssl_expires_at']
+        domain_expires_at = site['domain_expires_at']
+        hosting_expires_at = site['hosting_expires_at']
+        last_check = site['last_check']
+        
         # Используем оригинальный URL для отображения, если он есть
         display_url = original_url if original_url else url
         status = "✅ доступен" if is_up else "❌ недоступен"
@@ -486,6 +529,33 @@ async def cmd_list(message: Message):
             site_info += f"{ssl_status}\n"
         elif url.startswith('https://'):
             site_info += "❌ SSL сертификат не проверен\n"
+
+        # Добавляем информацию о датах истечения домена и хостинга
+        if domain_expires_at:
+            domain_date = datetime.fromisoformat(domain_expires_at).date()
+            domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+            if domain_days_left <= 0:
+                domain_status = f"⚠️ Домен истёк! ({domain_date.strftime('%d.%m.%Y')})"
+            elif domain_days_left <= 30:
+                domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+            else:
+                domain_status = f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+            site_info += f"Домен: {domain_status}\n"
+        else:
+            site_info += "Домен: дата не установлена\n"
+
+        if hosting_expires_at:
+            hosting_date = datetime.fromisoformat(hosting_expires_at).date()
+            hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+            if hosting_days_left <= 0:
+                hosting_status = f"⚠️ Хостинг истёк! ({hosting_date.strftime('%d.%m.%Y')})"
+            elif hosting_days_left <= 30:
+                hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+            else:
+                hosting_status = f"Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+            site_info += f"Хостинг: {hosting_status}\n"
+        else:
+            site_info += "Хостинг: дата не установлена\n"
 
         site_info += f"Последняя проверка: {last_check_str}\n\n"
         response += site_info
@@ -668,6 +738,142 @@ async def cmd_diagnose(message: Message):
         )
 
 
+# Обработчик команды /setdomain
+@dp.message(Command("setdomain"))
+async def cmd_setdomain(message: Message, state: FSMContext):
+    # Проверка прав для групп
+    if message.chat.type in ['group', 'supergroup']:
+        if not await is_admin_in_chat(message.chat.id, message.from_user.id):
+            await message.answer("Только администраторы могут устанавливать даты истечения в группе.")
+            return
+
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) < 2:
+        await message.answer("Укажите ID сайта: /setdomain ID")
+        return
+    
+    try:
+        site_id = int(command_parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+    
+    # Проверяем, существует ли сайт
+    site_data = supabase.table('botmonitor_sites').select('id, original_url, url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+    if not site_data.data:
+        await message.answer(f"Сайт с ID {site_id} не найден в этом чате.")
+        return
+    
+    site = site_data.data[0]
+    display_url = site['original_url'] if site['original_url'] else site['url']
+    
+    # Сохраняем ID сайта в состоянии
+    await state.update_data(site_id=site_id)
+    await state.set_state(SetExpiration.waiting_for_domain_date)
+    
+    await message.answer(
+        f"Установка даты истечения домена для сайта: {display_url}\n\n"
+        "Отправьте дату в формате YYYY-MM-DD (например: 2024-12-31)\n"
+        "Или отправьте 'отмена' для отмены операции."
+    )
+
+
+# Обработчик команды /sethosting
+@dp.message(Command("sethosting"))
+async def cmd_sethosting(message: Message, state: FSMContext):
+    # Проверка прав для групп
+    if message.chat.type in ['group', 'supergroup']:
+        if not await is_admin_in_chat(message.chat.id, message.from_user.id):
+            await message.answer("Только администраторы могут устанавливать даты истечения в группе.")
+            return
+
+    command_parts = message.text.split(maxsplit=1)
+    if len(command_parts) < 2:
+        await message.answer("Укажите ID сайта: /sethosting ID")
+        return
+    
+    try:
+        site_id = int(command_parts[1])
+    except ValueError:
+        await message.answer("ID должен быть числом.")
+        return
+    
+    # Проверяем, существует ли сайт
+    site_data = supabase.table('botmonitor_sites').select('id, original_url, url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
+    if not site_data.data:
+        await message.answer(f"Сайт с ID {site_id} не найден в этом чате.")
+        return
+    
+    site = site_data.data[0]
+    display_url = site['original_url'] if site['original_url'] else site['url']
+    
+    # Сохраняем ID сайта в состоянии
+    await state.update_data(site_id=site_id)
+    await state.set_state(SetExpiration.waiting_for_hosting_date)
+    
+    await message.answer(
+        f"Установка даты истечения хостинга для сайта: {display_url}\n\n"
+        "Отправьте дату в формате YYYY-MM-DD (например: 2024-12-31)\n"
+        "Или отправьте 'отмена' для отмены операции."
+    )
+
+
+# Обработчик ввода даты истечения домена
+@dp.message(SetExpiration.waiting_for_domain_date)
+async def process_domain_date_input(message: Message, state: FSMContext):
+    if message.text.lower() == 'отмена':
+        await state.clear()
+        await message.answer("Операция отменена.")
+        return
+    
+    try:
+        # Парсим дату
+        date_obj = datetime.strptime(message.text, '%Y-%m-%d').date()
+        
+        # Получаем ID сайта из состояния
+        data = await state.get_data()
+        site_id = data['site_id']
+        
+        # Обновляем дату в базе данных
+        supabase.table('botmonitor_sites').update({
+            'domain_expires_at': date_obj.isoformat()
+        }).eq('id', site_id).execute()
+        
+        await message.answer(f"✅ Дата истечения домена установлена: {date_obj.strftime('%d.%m.%Y')}")
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Используйте формат YYYY-MM-DD (например: 2024-12-31)")
+
+
+# Обработчик ввода даты истечения хостинга
+@dp.message(SetExpiration.waiting_for_hosting_date)
+async def process_hosting_date_input(message: Message, state: FSMContext):
+    if message.text.lower() == 'отмена':
+        await state.clear()
+        await message.answer("Операция отменена.")
+        return
+    
+    try:
+        # Парсим дату
+        date_obj = datetime.strptime(message.text, '%Y-%m-%d').date()
+        
+        # Получаем ID сайта из состояния
+        data = await state.get_data()
+        site_id = data['site_id']
+        
+        # Обновляем дату в базе данных
+        supabase.table('botmonitor_sites').update({
+            'hosting_expires_at': date_obj.isoformat()
+        }).eq('id', site_id).execute()
+        
+        await message.answer(f"✅ Дата истечения хостинга установлена: {date_obj.strftime('%d.%m.%Y')}")
+        await state.clear()
+        
+    except ValueError:
+        await message.answer("❌ Неверный формат даты. Используйте формат YYYY-MM-DD (например: 2024-12-31)")
+
+
 # Обработчик упоминаний бота в группах
 @dp.message(F.chat.type.in_(['group', 'supergroup']), F.text)
 async def handle_group_mention(message: Message):
@@ -804,40 +1010,33 @@ async def check_site(url):
 async def scheduled_check():
     while True:
         try:
-            sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, user_id, chat_id, is_up, has_ssl, ssl_expires_at').execute()
-            sites = [(s['id'], s['url'], s['original_url'], s['user_id'], s['chat_id'], s['is_up'], s['has_ssl'], s['ssl_expires_at']) for s in sites_data.data]
+            # Выбираем все поля, включая новые даты
+            sites_data = supabase.table('botmonitor_sites').select(
+                'id, url, original_url, user_id, chat_id, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at'
+            ).execute()
+            sites = sites_data.data
 
-            for site_id, url, original_url, user_id, chat_id, was_up, had_ssl, old_ssl_expires_at in sites:
+            for site in sites:
+                site_id, url, original_url, user_id, chat_id = site['id'], site['url'], site['original_url'], site['user_id'], site['chat_id']
+                was_up, had_ssl, old_ssl_expires_at = site['is_up'], site['has_ssl'], site['ssl_expires_at']
                 display_url = original_url if original_url else url
                 now = datetime.now(timezone.utc)
 
-                # Проверяем доступность
+                # 1. Проверяем доступность
                 status, status_code = await check_site(url)
                 status_changed = status != bool(was_up)
 
-                # Проверяем SSL, если сайт доступен и использует HTTPS
-                ssl_info = None
-                has_ssl = False
-                ssl_expires_at = old_ssl_expires_at
-                ssl_changed = False
-                ssl_warning = False
-                
-                # Обработка парсинга дат из Supabase
-                if old_ssl_expires_at and isinstance(old_ssl_expires_at, str):
-                    old_ssl_expires_at = datetime.fromisoformat(old_ssl_expires_at.replace('Z', '+00:00'))
-
+                # 2. Проверяем SSL
+                has_ssl, ssl_info, ssl_expires_at, ssl_changed, ssl_warning = False, None, old_ssl_expires_at, False, False
                 if status and url.startswith('https://'):
                     ssl_info = await check_ssl_certificate(url)
                     has_ssl = ssl_info.get('has_ssl', False)
                     ssl_changed = has_ssl != bool(had_ssl)
-
                     if has_ssl:
                         ssl_expires_at = ssl_info.get('expiry_date')
-
-                        # Проверяем, нужно ли отправить предупреждение о скором истечении сертификата
+                        # Проверяем, нужно ли отправить предупреждение
                         if ssl_info.get('expires_soon') or ssl_info.get('expired'):
-                            # Если старых данных не было или дата изменилась
-                            if not old_ssl_expires_at or str(ssl_expires_at) != old_ssl_expires_at:
+                            if not old_ssl_expires_at or (ssl_expires_at and str(ssl_expires_at) != old_ssl_expires_at):
                                 ssl_warning = True
 
                 # Обновляем статус в БД
@@ -848,43 +1047,43 @@ async def scheduled_check():
                     'last_check': now.isoformat()
                 }).eq('id', site_id).execute()
 
-                # Отправляем уведомления при изменении статуса
-                try:
-                    # Уведомление об изменении доступности
-                    if status_changed:
-                        if status:
-                            message_text = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
-                        else:
-                            message_text = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
-                        await safe_send_message(chat_id=chat_id, text=message_text)
+                # 3. Отправляем уведомления о доступности и SSL
+                if status_changed:
+                    message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}" if status else f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}"
+                    await send_notification(chat_id, message)
+                
+                if ssl_warning and has_ssl:
+                    days_left = ssl_info.get('days_left')
+                    if ssl_info.get('expired'):
+                        message = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
+                    else:
+                        message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!"
+                    await send_notification(chat_id, message)
 
-                    # Уведомление об изменении SSL
-                    if ssl_changed and has_ssl:
-                        days_left = ssl_info.get('days_left')
-                        message_text = f"🔒 Обнаружен SSL сертификат для {display_url}\nДействителен до: {ssl_expires_at.strftime('%d.%m.%Y')}\n"
-                        if ssl_info.get('expired'):
-                            message_text += "⚠️ Сертификат ИСТЁК! Требуется обновление."
-                        elif ssl_info.get('expires_soon'):
-                            message_text += f"⚠️ Сертификат истекает через {days_left} дней!"
-                        await safe_send_message(chat_id=chat_id, text=message_text)
+                # 4. Проверяем даты домена и хостинга и отправляем уведомления
+                now_date = now.date()
+                notification_points = [30, 15, 7, 3, 1] # Дни для отправки уведомлений
 
-                    # Уведомление о скором истечении SSL
-                    elif ssl_warning and has_ssl:
-                        days_left = ssl_info.get('days_left')
-                        if ssl_info.get('expired'):
-                            message_text = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
-                        else:
-                            message_text = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!\nРекомендуется обновить сертификат."
-                        await safe_send_message(chat_id=chat_id, text=message_text)
+                # Проверка домена
+                if site.get('domain_expires_at'):
+                    domain_expiry_date = datetime.fromisoformat(site['domain_expires_at']).date()
+                    days_left = (domain_expiry_date - now_date).days
+                    if days_left in notification_points:
+                        message = f"‼️ Напоминание: Срок оплаты домена для сайта {display_url} истекает через {days_left} дней ({domain_expiry_date.strftime('%d.%m.%Y')})!"
+                        await send_notification(chat_id, message)
 
-                except Exception as e:
-                    logging.error(f"Error sending notification to chat {chat_id}: {e}")
-
+                # Проверка хостинга
+                if site.get('hosting_expires_at'):
+                    hosting_expiry_date = datetime.fromisoformat(site['hosting_expires_at']).date()
+                    days_left = (hosting_expiry_date - now_date).days
+                    if days_left in notification_points:
+                        message = f"‼️ Напоминание: Срок оплаты хостинга для сайта {display_url} истекает через {days_left} дней ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
+                        await send_notification(chat_id, message)
 
         except Exception as e:
             logging.error(f"Error in scheduled check: {e}")
-
-        # Ждем определенное время перед следующей проверкой
+            await send_admin_notification(f"Критическая ошибка в scheduled_check: {e}") # Уведомляем админа о сбое
+        
         await asyncio.sleep(CHECK_INTERVAL)
 
 
