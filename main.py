@@ -61,6 +61,20 @@ async def send_admin_notification(message: str):
     except Exception as e:
         logging.error(f"Ошибка отправки уведомления админу: {e}")
 
+
+def get_sites_count():
+    """Возвращает количество сайтов в базе данных"""
+    try:
+        conn = sqlite3.connect('sites_monitor.db')
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(*) FROM sites")
+        count = cursor.fetchone()[0]
+        conn.close()
+        return count
+    except Exception as e:
+        logging.error(f"Ошибка получения количества сайтов: {e}")
+        return 0
+
 # Функция для обработки URL с поддержкой IDN (Internationalized Domain Names)
 def process_url(url):
     url = url.strip()
@@ -554,10 +568,14 @@ async def main():
     init_db()
     update_db()  # Add this line
     
+    # Получаем количество сайтов в базе данных
+    sites_count = get_sites_count()
+    
     # Отправляем уведомление админу о запуске
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
                      f"⏰ Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
-                     f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут"
+                     f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
+                     f"📊 Сайтов в базе проверки: {sites_count}"
     await send_admin_notification(startup_message)
     
     # Запускаем задачу проверки сайтов при старте
