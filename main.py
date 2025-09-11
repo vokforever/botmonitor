@@ -944,7 +944,7 @@ async def handle_group_mention(message: Message):
     if domain:
         logging.info(f"Получен запрос для конкретного домена: {domain}")
         # Ищем этот сайт в базе данных для текущего чата
-        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check').eq('chat_id', message.chat.id).execute()
         
         found_site = None
         for site in sites_data.data:
@@ -964,6 +964,8 @@ async def handle_group_mention(message: Message):
         is_up = found_site['is_up']
         has_ssl = found_site['has_ssl']
         ssl_expires_at = found_site['ssl_expires_at']
+        domain_expires_at = found_site['domain_expires_at']
+        hosting_expires_at = found_site['hosting_expires_at']
         last_check = found_site['last_check']
         
         display_url = original_url if original_url else site_url
@@ -987,6 +989,34 @@ async def handle_group_mention(message: Message):
             response_text += f"**SSL:** {ssl_status}\n"
         elif site_url.startswith('https://'):
             response_text += "**SSL:** ❌ Сертификат не найден или недействителен\n"
+        
+        # Добавляем информацию о сроках окончания домена
+        if domain_expires_at:
+            domain_date = datetime.fromisoformat(domain_expires_at).date()
+            domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+            if domain_days_left <= 0:
+                domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+            elif domain_days_left <= 30:
+                domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+            else:
+                domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+            response_text += f"**Домен:** {domain_status}\n"
+        else:
+            response_text += "**Домен:** Дата не установлена\n"
+        
+        # Добавляем информацию о сроках окончания хостинга
+        if hosting_expires_at:
+            hosting_date = datetime.fromisoformat(hosting_expires_at).date()
+            hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+            if hosting_days_left <= 0:
+                hosting_status = f"⚠️ **Хостинг истёк!** ({hosting_date.strftime('%d.%m.%Y')})"
+            elif hosting_days_left <= 30:
+                hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+            else:
+                hosting_status = f"✅ Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+            response_text += f"**Хостинг:** {hosting_status}\n"
+        else:
+            response_text += "**Хостинг:** Дата не установлена\n"
         
         response_text += f"**Последняя проверка:** {last_check_str}"
         
