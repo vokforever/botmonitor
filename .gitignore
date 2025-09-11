@@ -49,6 +49,10 @@ venv.bak/
 sites_monitor*.db
 sites_monitor_backup_*.db
 
+# Domain management files (sensitive data)
+domains_bulk_insert.sql
+DOMAINS_SETUP_INSTRUCTIONS.md
+
 # Logs
 *.log
 logs/
