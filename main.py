@@ -26,6 +26,12 @@ logging.basicConfig(level=logging.INFO)
 API_TOKEN = os.getenv('API_TOKEN')
 if not API_TOKEN:
     raise ValueError("API_TOKEN не найден в переменных окружения. Создайте .env файл с API_TOKEN=your_token")
+
+# ID чата администратора для уведомлений
+ADMIN_CHAT_ID = os.getenv('ADMIN_CHAT_ID')
+if not ADMIN_CHAT_ID:
+    raise ValueError("ADMIN_CHAT_ID не найден в переменных окружения. Создайте .env файл с ADMIN_CHAT_ID=your_chat_id")
+
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
@@ -45,6 +51,15 @@ def update_db():
         # Column might already exist
         pass
     conn.close()
+
+
+async def send_admin_notification(message: str):
+    """Отправляет уведомление администратору"""
+    try:
+        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=message)
+        logging.info(f"Уведомление отправлено админу: {message}")
+    except Exception as e:
+        logging.error(f"Ошибка отправки уведомления админу: {e}")
 
 # Функция для обработки URL с поддержкой IDN (Internationalized Domain Names)
 def process_url(url):
@@ -538,6 +553,13 @@ async def on_startup():
 async def main():
     init_db()
     update_db()  # Add this line
+    
+    # Отправляем уведомление админу о запуске
+    startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
+                     f"⏰ Время запуска: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n" \
+                     f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут"
+    await send_admin_notification(startup_message)
+    
     # Запускаем задачу проверки сайтов при старте
     await on_startup()
     # Запуск бота
