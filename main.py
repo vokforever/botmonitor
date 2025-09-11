@@ -1066,42 +1066,15 @@ async def handle_group_mention(message: Message):
         
         # 2. ВЫПОЛНЯЕМ ПРОВЕРКИ (МОЖЕТ ЗАНЯТЬ ВРЕМЯ)
         results = []
+        
+        # Проверяем, есть ли резервные домены в этом чате
+        has_reserve_domains = any(site[3] for site in sites)  # site[3] это is_reserve_domain
+        
         for site_id, url, original_url, is_reserve_domain, domain_expires_at, hosting_expires_at in sites:
             display_url = original_url if original_url else url
             
-            # Для резервных доменов не проверяем доступность
+            # Для резервных доменов не проверяем доступность и не показываем их
             if is_reserve_domain:
-                site_info = f"**URL:** {display_url}\n**Статус:** 🔄 резервный домен (проверка пропущена)"
-                
-                # Добавляем информацию о сроках окончания домена для резервных доменов
-                if domain_expires_at:
-                    domain_date = datetime.fromisoformat(domain_expires_at).date()
-                    domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
-                    if domain_days_left <= 0:
-                        domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
-                    elif domain_days_left <= 30:
-                        domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
-                    else:
-                        domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
-                    site_info += f"\n**Домен:** {domain_status}"
-                else:
-                    site_info += "\n**Домен:** Дата не установлена"
-                
-                # Добавляем информацию о сроках окончания хостинга для резервных доменов
-                if hosting_expires_at:
-                    hosting_date = datetime.fromisoformat(hosting_expires_at).date()
-                    hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
-                    if hosting_days_left <= 0:
-                        hosting_status = f"⚠️ **Хостинг истёк!** ({hosting_date.strftime('%d.%m.%Y')})"
-                    elif hosting_days_left <= 30:
-                        hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
-                    else:
-                        hosting_status = f"✅ Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
-                    site_info += f"\n**Хостинг:** {hosting_status}"
-                else:
-                    site_info += "\n**Хостинг:** Дата не установлена"
-                
-                results.append(site_info)
                 continue
             
             status, status_code = await check_site(url)
@@ -1167,6 +1140,9 @@ async def handle_group_mention(message: Message):
         # 3. ОТПРАВЛЯЕМ РЕЗУЛЬТАТЫ (с разбивкой на части если нужно)
         response = "📊 **Результаты проверки сайтов в этом чате:**\n\n" + "\n\n".join(results)
         
+        if has_reserve_domains:
+            response += f"\n\n🔄 **Есть резервные домены** (нажмите кнопку ниже для просмотра)"
+        
         # Удаляем исходное сообщение
         try:
             await bot.delete_message(chat_id=message.chat.id, message_id=msg.message_id)
@@ -1175,13 +1151,23 @@ async def handle_group_mention(message: Message):
         
         # Разбиваем сообщение на части и отправляем
         message_parts = split_message(response)
+        keyboard = get_sites_keyboard() if has_reserve_domains else None
+        
         for i, part in enumerate(message_parts):
             if i == 0:
                 # Первое сообщение как ответ на исходное
-                await safe_reply_message(message, part, parse_mode="Markdown")
+                if keyboard and i == len(message_parts) - 1:
+                    # Если это единственное сообщение и есть кнопка, добавляем её
+                    await message.reply(part, parse_mode="Markdown", reply_markup=keyboard)
+                else:
+                    await safe_reply_message(message, part, parse_mode="Markdown")
             else:
                 # Остальные как обычные сообщения
-                await safe_send_message(message.chat.id, part, parse_mode="Markdown")
+                if keyboard and i == len(message_parts) - 1:
+                    # Если это последнее сообщение и есть кнопка, добавляем её
+                    await bot.send_message(message.chat.id, part, parse_mode="Markdown", reply_markup=keyboard)
+                else:
+                    await safe_send_message(message.chat.id, part, parse_mode="Markdown")
 
 
 # Функция проверки доступности сайта
@@ -1294,6 +1280,16 @@ def get_renewal_keyboard(site_id: int, renewal_type: str) -> InlineKeyboardMarku
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
     return keyboard
 
+def get_sites_keyboard() -> InlineKeyboardMarkup:
+    """Создает клавиатуру с кнопками для управления отображением сайтов."""
+    buttons = [
+        [
+            InlineKeyboardButton(text="🔄 Показать резервные домены", callback_data="show_reserve_domains")
+        ]
+    ]
+    keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
+    return keyboard
+
 @dp.callback_query(F.data.startswith("renew:"))
 async def handle_renew_callback(callback: CallbackQuery):
     """Обрабатывает нажатие на кнопку 'Продлён'."""
@@ -1334,6 +1330,70 @@ async def handle_snooze_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{callback.message.text}\n\n*OK, вы получили это уведомление.*"
     )
+
+@dp.callback_query(F.data == "show_reserve_domains")
+async def handle_show_reserve_domains_callback(callback: CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Показать резервные домены'."""
+    try:
+        # Получаем резервные домены для этого чата
+        sites_data = supabase.table('botmonitor_sites').select(
+            'id, url, original_url, domain_expires_at, hosting_expires_at'
+        ).eq('chat_id', callback.message.chat.id).eq('is_reserve_domain', True).execute()
+        
+        if not sites_data.data:
+            await callback.answer("Резервных доменов не найдено.")
+            return
+        
+        results = []
+        for site in sites_data.data:
+            display_url = site['original_url'] if site['original_url'] else site['url']
+            site_info = f"**URL:** {display_url}\n**Статус:** 🔄 резервный домен (проверка пропущена)"
+            
+            # Добавляем информацию о сроках окончания домена
+            if site.get('domain_expires_at'):
+                domain_date = datetime.fromisoformat(site['domain_expires_at']).date()
+                domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+                if domain_days_left <= 0:
+                    domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                elif domain_days_left <= 30:
+                    domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                else:
+                    domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                site_info += f"\n**Домен:** {domain_status}"
+            else:
+                site_info += "\n**Домен:** Дата не установлена"
+            
+            # Добавляем информацию о сроках окончания хостинга
+            if site.get('hosting_expires_at'):
+                hosting_date = datetime.fromisoformat(site['hosting_expires_at']).date()
+                hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+                if hosting_days_left <= 0:
+                    hosting_status = f"⚠️ **Хостинг истёк!** ({hosting_date.strftime('%d.%m.%Y')})"
+                elif hosting_days_left <= 30:
+                    hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+                else:
+                    hosting_status = f"✅ Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+                site_info += f"\n**Хостинг:** {hosting_status}"
+            else:
+                site_info += "\n**Хостинг:** Дата не установлена"
+            
+            results.append(site_info)
+        
+        response = "🔄 **Резервные домены в этом чате:**\n\n" + "\n\n".join(results)
+        
+        # Разбиваем сообщение на части и отправляем
+        message_parts = split_message(response)
+        for i, part in enumerate(message_parts):
+            if i == 0:
+                await callback.message.reply(part, parse_mode="Markdown")
+            else:
+                await bot.send_message(callback.message.chat.id, part, parse_mode="Markdown")
+        
+        await callback.answer("Резервные домены показаны.")
+        
+    except Exception as e:
+        logging.error(f"Error in handle_show_reserve_domains_callback: {e}")
+        await callback.answer("Ошибка при получении резервных доменов.")
 
 
 # Функция проверки доступности сайтов (каждые 5 минут)
