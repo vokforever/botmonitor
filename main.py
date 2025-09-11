@@ -6,6 +6,7 @@ import idna  # для работы с Punycode
 import ssl
 import socket
 import OpenSSL
+import os
 from datetime import datetime, timedelta
 from aiogram import Bot, Dispatcher, types, F
 from aiogram.fsm.storage.memory import MemoryStorage
@@ -13,12 +14,18 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
 from aiogram.types import Message
+from dotenv import load_dotenv
+
+# Загружаем переменные окружения из .env файла
+load_dotenv()
 
 # Настройка логирования
 logging.basicConfig(level=logging.INFO)
 
-# Инициализация бота (вставьте свой API_TOKEN)
-API_TOKEN = '7253515169:AAHK3c9wIC2vlSVn7yPi5EDkZopW9g_iVKs'
+# Инициализация бота (загружаем токен из переменных окружения)
+API_TOKEN = os.getenv('API_TOKEN')
+if not API_TOKEN:
+    raise ValueError("API_TOKEN не найден в переменных окружения. Создайте .env файл с API_TOKEN=your_token")
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
