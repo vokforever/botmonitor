@@ -149,6 +149,35 @@ async def safe_reply_message(message: Message, text: str, parse_mode: str = None
             return False
     return False
 
+def split_message(text: str, max_length: int = 4000) -> list:
+    """Разбивает длинное сообщение на части для отправки в Telegram"""
+    if len(text) <= max_length:
+        return [text]
+    
+    parts = []
+    lines = text.split('\n')
+    current_part = ""
+    
+    for line in lines:
+        # Если добавление строки превысит лимит, сохраняем текущую часть
+        if len(current_part) + len(line) + 1 > max_length:
+            if current_part:
+                parts.append(current_part.strip())
+                current_part = line
+            else:
+                # Если одна строка слишком длинная, обрезаем её
+                parts.append(line[:max_length])
+        else:
+            if current_part:
+                current_part += '\n' + line
+            else:
+                current_part = line
+    
+    if current_part:
+        parts.append(current_part.strip())
+    
+    return parts
+
 
 def get_sites_count():
     """Возвращает количество сайтов в базе данных (исключая резервные домены)"""
@@ -1106,9 +1135,24 @@ async def handle_group_mention(message: Message):
                 'last_check': datetime.now(timezone.utc).isoformat()
             }).eq('id', site_id).execute()
             
-        # 3. ЗАМЕНЯЕМ ИСХОДНОЕ СООБЩЕНИЕ ИТОГОВЫМ РЕЗУЛЬТАТОМ
+        # 3. ОТПРАВЛЯЕМ РЕЗУЛЬТАТЫ (с разбивкой на части если нужно)
         response = "📊 **Результаты проверки сайтов в этом чате:**\n\n" + "\n\n".join(results)
-        await bot.edit_message_text(response, chat_id=message.chat.id, message_id=msg.message_id, parse_mode="Markdown")
+        
+        # Удаляем исходное сообщение
+        try:
+            await bot.delete_message(chat_id=message.chat.id, message_id=msg.message_id)
+        except Exception as e:
+            logging.warning(f"Could not delete message: {e}")
+        
+        # Разбиваем сообщение на части и отправляем
+        message_parts = split_message(response)
+        for i, part in enumerate(message_parts):
+            if i == 0:
+                # Первое сообщение как ответ на исходное
+                await safe_reply_message(message, part, parse_mode="Markdown")
+            else:
+                # Остальные как обычные сообщения
+                await safe_send_message(message.chat.id, part, parse_mode="Markdown")
 
 
 # Функция проверки доступности сайта
