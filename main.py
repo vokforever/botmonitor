@@ -1025,8 +1025,8 @@ async def handle_group_mention(message: Message):
     # Если домен НЕ указан, показываем статус всех сайтов в чате
     else:
         logging.info(f"Получен запрос на статус всех сайтов для чата {message.chat.id}")
-        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url').eq('chat_id', message.chat.id).execute()
-        sites = [(s['id'], s['url'], s['original_url']) for s in sites_data.data]
+        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_reserve_domain, domain_expires_at, hosting_expires_at').eq('chat_id', message.chat.id).execute()
+        sites = [(s['id'], s['url'], s['original_url'], s.get('is_reserve_domain', False), s.get('domain_expires_at'), s.get('hosting_expires_at')) for s in sites_data.data]
         
         if not sites:
             await safe_reply_message(message, "📝 В этом чате нет сайтов для мониторинга. Добавьте сайт командой /add")
@@ -1037,8 +1037,44 @@ async def handle_group_mention(message: Message):
         
         # 2. ВЫПОЛНЯЕМ ПРОВЕРКИ (МОЖЕТ ЗАНЯТЬ ВРЕМЯ)
         results = []
-        for site_id, url, original_url in sites:
+        for site_id, url, original_url, is_reserve_domain, domain_expires_at, hosting_expires_at in sites:
             display_url = original_url if original_url else url
+            
+            # Для резервных доменов не проверяем доступность
+            if is_reserve_domain:
+                site_info = f"**URL:** {display_url}\n**Статус:** 🔄 резервный домен (проверка пропущена)"
+                
+                # Добавляем информацию о сроках окончания домена для резервных доменов
+                if domain_expires_at:
+                    domain_date = datetime.fromisoformat(domain_expires_at).date()
+                    domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+                    if domain_days_left <= 0:
+                        domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                    elif domain_days_left <= 30:
+                        domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                    else:
+                        domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                    site_info += f"\n**Домен:** {domain_status}"
+                else:
+                    site_info += "\n**Домен:** Дата не установлена"
+                
+                # Добавляем информацию о сроках окончания хостинга для резервных доменов
+                if hosting_expires_at:
+                    hosting_date = datetime.fromisoformat(hosting_expires_at).date()
+                    hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+                    if hosting_days_left <= 0:
+                        hosting_status = f"⚠️ **Хостинг истёк!** ({hosting_date.strftime('%d.%m.%Y')})"
+                    elif hosting_days_left <= 30:
+                        hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+                    else:
+                        hosting_status = f"✅ Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+                    site_info += f"\n**Хостинг:** {hosting_status}"
+                else:
+                    site_info += "\n**Хостинг:** Дата не установлена"
+                
+                results.append(site_info)
+                continue
+            
             status, status_code = await check_site(url)
             status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code})"
             site_info = f"**URL:** {display_url}\n**Статус:** {status_str}"
@@ -1062,7 +1098,7 @@ async def handle_group_mention(message: Message):
                     site_info += "\n**SSL:** ❌ не найден или недействителен"
             results.append(site_info)
             
-            # Обновляем статус в БД
+            # Обновляем статус в БД только для нерезервных доменов
             supabase.table('botmonitor_sites').update({
                 'is_up': status,
                 'has_ssl': has_ssl,
