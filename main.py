@@ -1125,6 +1125,35 @@ async def handle_group_mention(message: Message):
                     ssl_expires_at = expiry_date
                 else:
                     site_info += "\n**SSL:** ❌ не найден или недействителен"
+            
+            # Добавляем информацию о сроках окончания домена для всех сайтов
+            if domain_expires_at:
+                domain_date = datetime.fromisoformat(domain_expires_at).date()
+                domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+                if domain_days_left <= 0:
+                    domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                elif domain_days_left <= 30:
+                    domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                else:
+                    domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                site_info += f"\n**Домен:** {domain_status}"
+            else:
+                site_info += "\n**Домен:** Дата не установлена"
+            
+            # Добавляем информацию о сроках окончания хостинга для всех сайтов
+            if hosting_expires_at:
+                hosting_date = datetime.fromisoformat(hosting_expires_at).date()
+                hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+                if hosting_days_left <= 0:
+                    hosting_status = f"⚠️ **Хостинг истёк!** ({hosting_date.strftime('%d.%m.%Y')})"
+                elif hosting_days_left <= 30:
+                    hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+                else:
+                    hosting_status = f"✅ Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+                site_info += f"\n**Хостинг:** {hosting_status}"
+            else:
+                site_info += "\n**Хостинг:** Дата не установлена"
+            
             results.append(site_info)
             
             # Обновляем статус в БД только для нерезервных доменов
