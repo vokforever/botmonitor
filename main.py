@@ -13,6 +13,7 @@ from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
 from aiogram.types import Message
+from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -74,6 +75,54 @@ async def send_admin_notification(message: str):
         logging.info(f"Уведомление отправлено админу: {message}")
     except Exception as e:
         logging.error(f"Ошибка отправки уведомления админу: {e}")
+
+async def safe_send_message(chat_id: int, text: str, parse_mode: str = None, max_retries: int = 3):
+    """Безопасная отправка сообщения с retry механизмом"""
+    for attempt in range(max_retries):
+        try:
+            if parse_mode:
+                await bot.send_message(chat_id=chat_id, text=text, parse_mode=parse_mode)
+            else:
+                await bot.send_message(chat_id=chat_id, text=text)
+            return True
+        except TelegramRetryAfter as e:
+            logging.warning(f"Rate limit hit, waiting {e.retry_after} seconds...")
+            await asyncio.sleep(e.retry_after)
+        except TelegramNetworkError as e:
+            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logging.error(f"Failed to send message after {max_retries} attempts: {e}")
+                return False
+        except Exception as e:
+            logging.error(f"Unexpected error sending message: {e}")
+            return False
+    return False
+
+async def safe_reply_message(message: Message, text: str, parse_mode: str = None, max_retries: int = 3):
+    """Безопасный ответ на сообщение с retry механизмом"""
+    for attempt in range(max_retries):
+        try:
+            if parse_mode:
+                await message.reply(text, parse_mode=parse_mode)
+            else:
+                await message.reply(text)
+            return True
+        except TelegramRetryAfter as e:
+            logging.warning(f"Rate limit hit, waiting {e.retry_after} seconds...")
+            await asyncio.sleep(e.retry_after)
+        except TelegramNetworkError as e:
+            logging.warning(f"Network error on attempt {attempt + 1}: {e}")
+            if attempt < max_retries - 1:
+                await asyncio.sleep(2 ** attempt)  # Exponential backoff
+            else:
+                logging.error(f"Failed to reply to message after {max_retries} attempts: {e}")
+                return False
+        except Exception as e:
+            logging.error(f"Unexpected error replying to message: {e}")
+            return False
+    return False
 
 
 def get_sites_count():
@@ -301,62 +350,72 @@ async def cmd_add(message: Message, state: FSMContext):
         if not await is_admin_in_chat(message.chat.id, message.from_user.id):
             await message.answer("Только администраторы могут добавлять сайты для мониторинга в группе.")
             return
-    
-    await state.set_state(AddSite.waiting_for_url)
-    await message.answer("Отправьте URL сайта, который хотите мониторить.\nНапример: example.com или цифровизируем.рф")
 
+    # Извлекаем URL, если он передан вместе с командой
+    command_parts = message.text.split(maxsplit=1)
+    url_from_args = command_parts[1] if len(command_parts) > 1 else None
 
-# Получение URL для добавления
+    if url_from_args:
+        # Если URL передан, сразу обрабатываем его
+        await process_and_add_site(url_from_args, message, state)
+    else:
+        # Если URL не передан, запрашиваем его как раньше
+        await state.set_state(AddSite.waiting_for_url)
+        await message.answer("Отправьте URL сайта, который хотите мониторить.\nНапример: example.com или цифровизируем.рф")
+
+# Получение URL для добавления (когда пользователь отправляет его после запроса)
 @dp.message(AddSite.waiting_for_url)
 async def process_url_input(message: Message, state: FSMContext):
-    original_url = message.text.strip()
-    url = process_url(original_url)
+    # Используем новую функцию для обработки
+    await process_and_add_site(message.text, message, state)
 
+# НОВАЯ ВСПОМОГАТЕЛЬНАЯ ФУНКЦИЯ для добавления сайта (чтобы не дублировать код)
+async def process_and_add_site(original_url: str, message: Message, state: FSMContext):
+    url = process_url(original_url)
     # Проверка, существует ли уже такой URL для этого пользователя
     existing = supabase.table('botmonitor_sites').select('id').eq('url', url).eq('chat_id', message.chat.id).execute()
     if existing.data:
         await message.answer(f"⚠️ Сайт {original_url} уже добавлен в мониторинг.")
         await state.clear()
         return
-
+        
     # Сначала сообщаем о начале проверки
     status_msg = await message.answer(f"🔄 Проверяю доступность сайта {original_url}...")
-
+    
     # Проверяем доступность сайта перед добавлением
     status, status_code = await check_site(url)
     is_up = 1 if status else 0
-
+    
     # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
     ssl_info = None
     has_ssl = 0
     ssl_expires_at = None
     ssl_message = ""
-
     if status and url.startswith('https://'):
         await bot.edit_message_text(f"🔄 Проверяю SSL сертификат для {original_url}...",
                                     chat_id=message.chat.id,
                                     message_id=status_msg.message_id)
         ssl_info = await check_ssl_certificate(url)
         has_ssl = 1 if ssl_info.get('has_ssl', False) else 0
-
         if has_ssl:
             ssl_expires_at = ssl_info.get('expiry_date')
             days_left = ssl_info.get('days_left')
-
             if ssl_info.get('expired'):
                 ssl_message = f"\n⚠️ SSL сертификат ИСТЁК!"
             elif ssl_info.get('expires_soon'):
                 ssl_message = f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
             else:
                 ssl_message = f"\nSSL сертификат действителен ещё {days_left} дней."
-
-            ssl_message += f"\nВыдан: {ssl_info.get('subject')}"
-            ssl_message += f"\nЦентр сертификации: {ssl_info.get('issuer')}"
+            # Используем .get для безопасного извлечения данных
+            subject_name = ssl_info.get('subject', 'N/A')
+            issuer_name = ssl_info.get('issuer', 'N/A')
+            ssl_message += f"\nВыдан: {subject_name}"
+            ssl_message += f"\nЦентр сертификации: {issuer_name}"
         else:
             ssl_message = "\n❌ SSL сертификат не найден или недействителен."
-
+            
     # Записываем сайт в базу данных
-    result = supabase.table('botmonitor_sites').insert({
+    supabase.table('botmonitor_sites').insert({
         'url': url,
         'original_url': original_url,
         'user_id': message.from_user.id,
@@ -367,12 +426,11 @@ async def process_url_input(message: Message, state: FSMContext):
         'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
         'last_check': datetime.now(timezone.utc).isoformat()
     }).execute()
-
-    # Если URL был преобразован, показываем пользователю информацию о конвертации
+    
     punycode_info = ""
     if url != original_url and "xn--" in url:
         punycode_info = f"\nПреобразовано в: {url}"
-
+        
     if status:
         await bot.edit_message_text(
             f"✅ Сайт {original_url} добавлен в мониторинг и сейчас доступен (код ответа: {status_code}).{punycode_info}{ssl_message}",
@@ -385,7 +443,6 @@ async def process_url_input(message: Message, state: FSMContext):
             chat_id=message.chat.id,
             message_id=status_msg.message_id
         )
-
     await state.clear()
 
 
@@ -629,7 +686,7 @@ async def handle_group_mention(message: Message):
 
     if not domain:
         logging.warning("Домен не найден после упоминания.")
-        await message.reply("Пожалуйста, укажите домен после упоминания бота. Например: @monitoring_saitov_digital_rf_bot vladograd.com")
+        await safe_reply_message(message, "Пожалуйста, укажите домен после упоминания бота. Например: @monitoring_saitov_digital_rf_bot vladograd.com")
         return
     
     # --- НАЧАЛО ДИАГНОСТИКИ ---
@@ -651,7 +708,7 @@ async def handle_group_mention(message: Message):
             
     if not found_site:
         logging.info(f"Сайт '{domain}' не найден в базе для чата {message.chat.id}")
-        await message.reply(f"Сайт {domain} не найден в списке отслеживаемых для этого чата.")
+        await safe_reply_message(message, f"Сайт {domain} не найден в списке отслеживаемых для этого чата.")
         return
     
     # --- НАЧАЛО ДИАГНОСТИКИ ---
@@ -691,7 +748,7 @@ async def handle_group_mention(message: Message):
     
     response_text += f"**Последняя проверка:** {last_check_str}"
     
-    await message.reply(response_text, parse_mode="Markdown")
+    await safe_reply_message(message, response_text, parse_mode="Markdown")
 
 
 # Функция проверки доступности сайта
@@ -757,29 +814,29 @@ async def scheduled_check():
                     # Уведомление об изменении доступности
                     if status_changed:
                         if status:
-                            message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
+                            message_text = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
                         else:
-                            message = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
-                        await bot.send_message(chat_id=chat_id, text=message)
+                            message_text = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nВремя: {now.strftime('%d.%m.%Y %H:%M:%S')}"
+                        await safe_send_message(chat_id=chat_id, text=message_text)
 
                     # Уведомление об изменении SSL
                     if ssl_changed and has_ssl:
                         days_left = ssl_info.get('days_left')
-                        message = f"🔒 Обнаружен SSL сертификат для {display_url}\nДействителен до: {ssl_expires_at.strftime('%d.%m.%Y')}\n"
+                        message_text = f"🔒 Обнаружен SSL сертификат для {display_url}\nДействителен до: {ssl_expires_at.strftime('%d.%m.%Y')}\n"
                         if ssl_info.get('expired'):
-                            message += "⚠️ Сертификат ИСТЁК! Требуется обновление."
+                            message_text += "⚠️ Сертификат ИСТЁК! Требуется обновление."
                         elif ssl_info.get('expires_soon'):
-                            message += f"⚠️ Сертификат истекает через {days_left} дней!"
-                        await bot.send_message(chat_id=chat_id, text=message)
+                            message_text += f"⚠️ Сертификат истекает через {days_left} дней!"
+                        await safe_send_message(chat_id=chat_id, text=message_text)
 
                     # Уведомление о скором истечении SSL
                     elif ssl_warning and has_ssl:
                         days_left = ssl_info.get('days_left')
                         if ssl_info.get('expired'):
-                            message = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
+                            message_text = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
                         else:
-                            message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!\nРекомендуется обновить сертификат."
-                        await bot.send_message(chat_id=chat_id, text=message)
+                            message_text = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!\nРекомендуется обновить сертификат."
+                        await safe_send_message(chat_id=chat_id, text=message_text)
 
                 except Exception as e:
                     logging.error(f"Error sending notification to chat {chat_id}: {e}")
