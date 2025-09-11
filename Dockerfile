@@ -1,52 +1,6 @@
 # Используем официальный Python образ
 FROM python:3.11-slim
 
-# Устанавливаем системные зависимости для Playwright и Chrome
-RUN apt-get update && apt-get install -y \
-    wget \
-    gnupg \
-    ca-certificates \
-    procps \
-    libxss1 \
-    libxrandr2 \
-    libasound2 \
-    libpangocairo-1.0-0 \
-    libatk1.0-0 \
-    libcairo-gobject2 \
-    libgtk-3-0 \
-    libgdk-pixbuf-2.0-0 \
-    libxcomposite1 \
-    libxcursor1 \
-    libxdamage1 \
-    libxext6 \
-    libxfixes3 \
-    libxi6 \
-    libxrender1 \
-    libxtst6 \
-    libnss3 \
-    libcups2 \
-    libatspi2.0-0 \
-    libdrm2 \
-    libxkbcommon0 \
-    libgbm1 \
-    libxshmfence1 \
-    libdrm-dev \
-    libx11-xcb1 \
-    libxcb-dri2-0 \
-    libxcb-dri3-0 \
-    libxcb-glx0 \
-    libxcb-present0 \
-    libxcb-randr0 \
-    libxcb-sync1 \
-    libxcb-xfixes0 \
-    libxcb-shm0 \
-    libwayland-client0 \
-    libwayland-egl1 \
-    mesa-utils \
-    fonts-liberation \
-    fonts-noto-cjk \
-    && rm -rf /var/lib/apt/lists/*
-
 # Устанавливаем рабочую директорию
 WORKDIR /app
 
@@ -56,22 +10,11 @@ COPY requirements.txt .
 # Устанавливаем Python зависимости
 RUN pip install --no-cache-dir -r requirements.txt
 
-# Устанавливаем браузеры Playwright
-RUN playwright install chromium
-RUN playwright install-deps chromium
-
-# Создаем директории для Chrome
-RUN mkdir -p /home/app/.cache/ms-playwright-chromium && \
-    chown -R app:app /home/app
-
 # Копируем исходный код
 COPY . .
 
 # Создаем пользователя для безопасности
-RUN useradd --create-home --shell /bin/bash app && \
-    chown -R app:app /app && \
-    chown -R app:app /home/app
-
+RUN useradd --create-home --shell /bin/bash app && chown -R app:app /app
 USER app
 
 # Открываем порт (CapRover автоматически назначит порт)

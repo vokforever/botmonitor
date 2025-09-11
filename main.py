@@ -37,10 +37,13 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL и SUPABASE_KEY не найдены в переменных окружения")
 
+# ScreenshotMachine API ключ (опционально)
+SCREENSHOTMACHINE_API_KEY = os.getenv('SCREENSHOTMACHINE_API_KEY')
+
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 from io import BytesIO
-from playwright.async_api import async_playwright
+import requests
 
 bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
@@ -167,163 +170,80 @@ async def check_ssl_certificate(url):
 
 
 async def take_screenshot(url: str) -> BytesIO:
+    """Создание скриншота через ScreenshotMachine API"""
+    if not SCREENSHOTMACHINE_API_KEY:
+        logging.error("ScreenshotMachine API key not provided")
+        return None
+    
     try:
-        logging.info(f"Starting screenshot for URL: {url}")
+        logging.info(f"Creating screenshot via ScreenshotMachine API for URL: {url}")
         
-        async with async_playwright() as p:
-            # Запускаем браузер с опциями для контейнера
-            browser = await p.chromium.launch(
-                headless=True,
-                args=[
-                    '--no-sandbox',
-                    '--disable-setuid-sandbox',
-                    '--disable-dev-shm-usage',
-                    '--disable-accelerated-2d-canvas',
-                    '--no-first-run',
-                    '--no-zygote',
-                    '--disable-gpu',
-                    '--disable-web-security',
-                    '--disable-features=VizDisplayCompositor',
-                    '--disable-background-timer-throttling',
-                    '--disable-backgrounding-occluded-windows',
-                    '--disable-renderer-backgrounding',
-                    '--disable-blink-features=AutomationControlled',
-                    '--disable-extensions',
-                    '--disable-plugins',
-                    '--disable-images',
-                    '--disable-javascript-harmony-promises',
-                    '--disable-wake-on-wifi',
-                    '--disable-ipc-flooding-protection',
-                    '--enable-unsafe-swiftshader',
-                    '--single-process',  # Для контейнеров
-                    '--disable-software-rasterizer',
-                    '--run-all-compositor-stages-before-draw',
-                    '--disable-background-mode',
-                    '--disable-client-side-phishing-detection',
-                    '--disable-crash-reporter',
-                    '--disable-default-apps',
-                    '--disable-extensions',
-                    '--disable-hang-monitor',
-                    '--disable-infobars',
-                    '--disable-notifications',
-                    '--disable-popup-blocking',
-                    '--disable-prompt-on-repost',
-                    '--disable-sync',
-                    '--force-color-profile=srgb',
-                    '--metrics-recording-only',
-                    '--no-pings',
-                    '--password-store=basic',
-                    '--use-mock-keychain',
-                    '--disable-field-trial-config',
-                    '--disable-logging',
-                    '--disable-breakpad',
-                    '--disable-component-update',
-                    '--disable-domain-reliability',
-                    '--disable-background-sync',
-                    '--disable-shader-cache',
-                    '--max_old_space_size=256'
-                ]
-            )
+        # Параметры для ScreenshotMachine API
+        params = {
+            'key': SCREENSHOTMACHINE_API_KEY,
+            'url': url,
+            'dimension': '1920x1080',  # Высокое разрешение
+            'format': 'PNG',
+            'cacheLimit': 0,  # Не кэшировать
+            'timeout': 30,    # 30 секунд таймаут
+            'device': 'desktop',
+            'fullPage': 'false',
+            'thumbnail': 'false'
+        }
+        
+        # Отправляем запрос к API
+        response = requests.get('https://api.screenshotmachine.com', params=params, timeout=35)
+        
+        if response.status_code == 200:
+            logging.info(f"Screenshot created successfully via API for {url}")
+            return BytesIO(response.content)
+        else:
+            logging.error(f"ScreenshotMachine API error: {response.status_code} - {response.text}")
+            return None
             
-            logging.info("Browser launched successfully")
-            
-            page = await browser.new_page(
-                viewport={'width': 1920, 'height': 1080},
-                java_script_enabled=True,
-                ignore_https_errors=True,
-                bypass_csp=True
-            )
-            
-            logging.info("Page created successfully")
-            
-            # Устанавливаем таймауты
-            page.set_default_timeout(30000)
-            page.set_default_navigation_timeout(30000)
-            
-            # Устанавливаем пользовательский агент
-            await page.set_extra_http_headers({
-                'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/91.0.4472.124 Safari/537.36',
-                'Accept': 'text/html,application/xhtml+xml,application/xml;q=0.9,image/webp,*/*;q=0.8',
-                'Accept-Language': 'en-US,en;q=0.5',
-                'Accept-Encoding': 'gzip, deflate, br',
-                'Connection': 'keep-alive',
-                'Upgrade-Insecure-Requests': '1'
-            })
-            
-            # Загружаем страницу
-            try:
-                response = await page.goto(
-                    url, 
-                    wait_until='domcontentloaded',
-                    timeout=25000
-                )
-                
-                if response:
-                    logging.info(f"Page loaded with status: {response.status}")
-                else:
-                    logging.warning(f"No response received for {url}")
-                    
-            except Exception as nav_error:
-                logging.warning(f"Navigation warning for {url}: {nav_error}")
-            
-            # Ждем для рендеринга
-            await page.wait_for_timeout(3000)
-            
-            # Делаем скриншот
-            screenshot = await page.screenshot(
-                full_page=False,
-                type='png',
-                timeout=15000,
-                animations='disabled',
-                caret='hide'
-            )
-            
-            logging.info(f"Screenshot captured successfully for {url}")
-            await browser.close()
-            return BytesIO(screenshot)
-            
+    except requests.exceptions.Timeout:
+        logging.error(f"Timeout while creating screenshot via API for {url}")
+        return None
+    except requests.exceptions.RequestException as e:
+        logging.error(f"Request error while creating screenshot via API for {url}: {e}")
+        return None
     except Exception as e:
-        logging.error(f"Error in take_screenshot for {url}: {str(e)}")
-        logging.error(f"Error type: {type(e).__name__}")
-        
-        # Дополнительная отладочная информация
-        if hasattr(e, 'args'):
-            logging.error(f"Error args: {e.args}")
-            
+        logging.error(f"Unexpected error while creating screenshot via API for {url}: {e}")
         return None
 
 
-async def diagnose_playwright():
-    """Диагностическая функция для проверки работы Playwright в контейнере"""
+async def diagnose_api():
+    """Диагностическая функция для проверки работы ScreenshotMachine API"""
     try:
-        logging.info("Starting Playwright diagnosis...")
+        logging.info("Starting ScreenshotMachine API diagnosis...")
         
-        async with async_playwright() as p:
-            # Проверяем доступные браузеры
-            browsers = await p.chromium.launch(
-                headless=True,
-                args=['--no-sandbox', '--disable-setuid-sandbox']
-            )
-            version = await browsers.version()
-            await browsers.close()
-            
-            logging.info(f"Chromium version: {version}")
-            logging.info(f"Playwright browsers path: {os.environ.get('PLAYWRIGHT_BROWSERS_PATH', 'Not set')}")
-            
-            # Проверяем наличие файлов браузера
-            browsers_path = os.environ.get('PLAYWRIGHT_BROWSERS_PATH', '/home/app/.cache/ms-playwright-chromium')
-            if os.path.exists(browsers_path):
-                logging.info(f"Browsers directory exists: {browsers_path}")
-                for root, dirs, files in os.walk(browsers_path):
-                    for file in files:
-                        if file.endswith('.sh') or file.endswith('chrome'):
-                            logging.info(f"Found browser file: {os.path.join(root, file)}")
-            else:
-                logging.error(f"Browsers directory not found: {browsers_path}")
-            
+        if not SCREENSHOTMACHINE_API_KEY:
+            logging.error("ScreenshotMachine API key not provided")
+            return False
+        
+        # Тестируем API с простым запросом
+        test_url = "https://httpbin.org/get"
+        params = {
+            'key': SCREENSHOTMACHINE_API_KEY,
+            'url': test_url,
+            'dimension': '1024x768',
+            'format': 'PNG',
+            'cacheLimit': 0,
+            'timeout': 10
+        }
+        
+        response = requests.get('https://api.screenshotmachine.com', params=params, timeout=15)
+        
+        if response.status_code == 200:
+            logging.info("ScreenshotMachine API is working correctly")
+            logging.info(f"API response size: {len(response.content)} bytes")
             return True
+        else:
+            logging.error(f"ScreenshotMachine API error: {response.status_code} - {response.text}")
+            return False
+            
     except Exception as e:
-        logging.error(f"Playwright diagnosis failed: {e}")
+        logging.error(f"ScreenshotMachine API diagnosis failed: {e}")
         return False
 
 
@@ -350,7 +270,7 @@ async def cmd_start(message: Message):
         "/status - проверить статус всех сайтов\n"
         "/help - показать справку\n"
         "/screenshot ID - сделать скриншот сайта\n"
-        "/diagnose - диагностика Playwright"
+        "/diagnose - диагностика ScreenshotMachine API"
     )
 
 
@@ -365,7 +285,7 @@ async def cmd_help(message: Message):
         "/status - выполнить проверку статуса всех сайтов\n"
         "/help - показать эту справку\n"
         "/screenshot ID - сделать скриншот сайта\n"
-        "/diagnose - диагностика Playwright\n\n"
+        "/diagnose - диагностика ScreenshotMachine API\n\n"
         "Бот автоматически проверяет доступность сайтов каждые 5 минут.\n"
         "Вы можете добавлять сайты с кириллическими доменами (например, цифровизируем.рф).\n"
         "Протокол (http:// или https://) добавляется автоматически, если не указан.\n"
@@ -634,6 +554,7 @@ async def cmd_screenshot(message: Message):
     msg = await message.answer(f"Создаю скриншот для {display_url}...")
     
     screenshot = await take_screenshot(url)
+    
     if screenshot:
         await bot.send_photo(
             chat_id=message.chat.id,
@@ -642,34 +563,35 @@ async def cmd_screenshot(message: Message):
         )
         await bot.delete_message(message.chat.id, msg.message_id)
     else:
-        await bot.edit_message_text("Ошибка создания скриншота", message.chat.id, msg.message_id)
+        await bot.edit_message_text("Ошибка создания скриншота. Проверьте API ключ ScreenshotMachine.", 
+                                  chat_id=message.chat.id, message_id=msg.message_id)
 
 
 @dp.message(Command("diagnose"))
 async def cmd_diagnose(message: Message):
-    """Команда диагностики Playwright"""
+    """Команда диагностики ScreenshotMachine API"""
     # Проверка прав для групп
     if message.chat.type in ['group', 'supergroup']:
         if not await is_admin_in_chat(message.chat.id, message.from_user.id):
             await message.answer("Только администраторы могут запускать диагностику в группе.")
             return
     
-    msg = await message.answer("🔍 Запускаю диагностику Playwright...")
+    msg = await message.answer("🔍 Запускаю диагностику ScreenshotMachine API...")
     
     try:
-        result = await diagnose_playwright()
+        result = await diagnose_api()
         
         if result:
             await bot.edit_message_text(
-                "✅ Диагностика Playwright завершена успешно!\n"
-                "Проверьте логи для подробной информации.",
+                "✅ Диагностика ScreenshotMachine API завершена успешно!\n"
+                "API работает корректно.",
                 chat_id=message.chat.id,
                 message_id=msg.message_id
             )
         else:
             await bot.edit_message_text(
-                "❌ Диагностика Playwright завершилась с ошибками!\n"
-                "Проверьте логи для подробной информации.",
+                "❌ Диагностика ScreenshotMachine API завершилась с ошибками!\n"
+                "Проверьте API ключ и логи для подробной информации.",
                 chat_id=message.chat.id,
                 message_id=msg.message_id
             )
@@ -790,16 +712,16 @@ async def main():
     # Получаем количество сайтов в базе данных
     sites_count = get_sites_count()
     
-    # Запускаем диагностику Playwright при старте
-    logging.info("Running Playwright diagnosis on startup...")
-    playwright_ok = await diagnose_playwright()
+    # Запускаем диагностику API при старте
+    logging.info("Running ScreenshotMachine API diagnosis on startup...")
+    api_ok = await diagnose_api()
     
     # Отправляем уведомление админу о запуске
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
                      f"⏰ Время запуска: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n" \
                      f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
                      f"📊 Сайтов в базе проверки: {sites_count}\n" \
-                     f"🎭 Playwright: {'✅ OK' if playwright_ok else '❌ Ошибка'}"
+                     f"📸 ScreenshotMachine API: {'✅ OK' if api_ok else '❌ Ошибка'}"
     await send_admin_notification(startup_message)
     
     # Запускаем задачу проверки сайтов при старте
