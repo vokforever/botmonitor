@@ -1,8 +1,7 @@
-playwright==1.40.0
 aiohttp==3.9.1
 aiogram==3.4.1
 supabase==2.5.0
 python-dotenv==1.0.0
 idna==3.6
-OpenSSL==24.2.1
-asyncio
+pyOpenSSL==24.2.1
+requests==2.31.0
