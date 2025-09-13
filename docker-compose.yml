@@ -1,0 +1,21 @@
+version: '3.8'
+
+services:
+  botmonitor:
+    build: .
+    container_name: botmonitor
+    restart: unless-stopped
+    environment:
+      - BOT_TOKEN=${BOT_TOKEN}
+      - CHAT_ID=${CHAT_ID}
+      # Добавьте другие переменные которые использует ваш бот
+    volumes:
+      # Если нужно сохранять данные/логи
+      - ./data:/app/data
+    # ports: (для telegram бота порты не нужны)
+    #   - "3000:3000"
+    logging:
+      driver: "json-file"
+      options:
+        max-size: "10m"
+        max-file: "3"
