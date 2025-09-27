@@ -188,6 +188,54 @@ def get_sites_count():
         logging.error(f"Ошибка получения количества сайтов: {e}")
         return 0
 
+def get_sites_by_chat_id_flexible(chat_id, select_fields='*'):
+    """
+    Функция для поиска записей по chat_id с учетом возможных типов данных.
+    Сначала пробует найти по исходному типу, потом по строковому представлению.
+    """
+    try:
+        # Сначала пробуем найти по исходному chat_id
+        logging.info(f"Ищем записи для chat_id={chat_id} (тип: {type(chat_id)})")
+        result = supabase.table('botmonitor_sites').select(select_fields).eq('chat_id', chat_id).execute()
+        
+        if result.data:
+            logging.info(f"Найдено {len(result.data)} записей для chat_id={chat_id}")
+            return result
+        
+        # Если не найдено, пробуем как строку
+        chat_id_str = str(chat_id)
+        logging.info(f"Записи не найдены, пробуем как строку: chat_id='{chat_id_str}'")
+        result = supabase.table('botmonitor_sites').select(select_fields).eq('chat_id', chat_id_str).execute()
+        
+        if result.data:
+            logging.info(f"Найдено {len(result.data)} записей для chat_id='{chat_id_str}' (строка)")
+            return result
+        
+        # Если и как строка не найдено, пробуем как int (если исходный тип был строка)
+        if isinstance(chat_id, str):
+            try:
+                chat_id_int = int(chat_id)
+                logging.info(f"Пробуем как число: chat_id={chat_id_int}")
+                result = supabase.table('botmonitor_sites').select(select_fields).eq('chat_id', chat_id_int).execute()
+                
+                if result.data:
+                    logging.info(f"Найдено {len(result.data)} записей для chat_id={chat_id_int} (число)")
+                    return result
+            except ValueError:
+                pass
+        
+        logging.warning(f"Не найдено записей для chat_id ни в одном формате: {chat_id}")
+        return result  # Возвращаем пустой результат
+        
+    except Exception as e:
+        logging.error(f"Ошибка в get_sites_by_chat_id_flexible: {e}")
+        # Возвращаем пустой результат в случае ошибки
+        class EmptyResult:
+            def __init__(self):
+                self.data = []
+                self.count = 0
+        return EmptyResult()
+
 # Функция для обработки URL с поддержкой IDN (Internationalized Domain Names)
 def process_url(url):
     url = url.strip()
@@ -562,10 +610,18 @@ async def cmd_reserve(message: Message):
 # Обработчик команды /list
 @dp.message(Command("list"))
 async def cmd_list(message: Message):
-    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check, is_reserve_domain').eq('chat_id', message.chat.id).execute()
+    logging.info(f"Команда /list для чата {message.chat.id}, тип: {type(message.chat.id)}")
+    
+    # Используем гибкую функцию поиска
+    sites_data = get_sites_by_chat_id_flexible(message.chat.id, 'id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check, is_reserve_domain')
+    logging.info(f"Команда /list - результат: data_length={len(sites_data.data) if sites_data.data else 0}")
+    
     sites = sites_data.data
 
     if not sites:
+        # Дополнительная диагностика
+        all_sites_data = supabase.table('botmonitor_sites').select('id, chat_id').limit(3).execute()
+        logging.info(f"Команда /list - примеры записей в базе: {all_sites_data.data}")
         await message.answer("📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
         return
 
@@ -685,10 +741,18 @@ async def cmd_remove(message: Message):
 # Обработчик команды /status
 @dp.message(Command("status"))
 async def cmd_status(message: Message):
-    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url').eq('chat_id', message.chat.id).execute()
+    logging.info(f"Команда /status для чата {message.chat.id}, тип: {type(message.chat.id)}")
+    
+    # Используем гибкую функцию поиска
+    sites_data = get_sites_by_chat_id_flexible(message.chat.id, 'id, url, original_url')
+    logging.info(f"Команда /status - результат: data_length={len(sites_data.data) if sites_data.data else 0}")
+    
     sites = [(s['id'], s['url'], s['original_url']) for s in sites_data.data]
 
     if not sites:
+        # Дополнительная диагностика
+        all_sites_data = supabase.table('botmonitor_sites').select('id, chat_id').limit(3).execute()
+        logging.info(f"Команда /status - примеры записей в базе: {all_sites_data.data}")
         await message.answer("📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
         return
 
@@ -1008,10 +1072,18 @@ async def handle_screenshot_command(message: Message, args: str):
 
 async def handle_status_command(message: Message):
     """Обработка команды /status в группе"""
-    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url').eq('chat_id', message.chat.id).execute()
+    logging.info(f"handle_status_command для чата {message.chat.id}, тип: {type(message.chat.id)}")
+    
+    # Используем гибкую функцию поиска
+    sites_data = get_sites_by_chat_id_flexible(message.chat.id, 'id, url, original_url')
+    logging.info(f"handle_status_command - результат: data_length={len(sites_data.data) if sites_data.data else 0}")
+    
     sites = [(s['id'], s['url'], s['original_url']) for s in sites_data.data]
 
     if not sites:
+        # Дополнительная диагностика
+        all_sites_data = supabase.table('botmonitor_sites').select('id, chat_id').limit(3).execute()
+        logging.info(f"handle_status_command - примеры записей в базе: {all_sites_data.data}")
         await safe_reply_message(message, "📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
         return
 
@@ -1066,10 +1138,18 @@ async def handle_status_command(message: Message):
 
 async def handle_list_command(message: Message):
     """Обработка команды /list в группе"""
-    sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check, is_reserve_domain').eq('chat_id', message.chat.id).execute()
+    logging.info(f"handle_list_command для чата {message.chat.id}, тип: {type(message.chat.id)}")
+    
+    # Используем гибкую функцию поиска
+    sites_data = get_sites_by_chat_id_flexible(message.chat.id, 'id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check, is_reserve_domain')
+    logging.info(f"handle_list_command - результат: data_length={len(sites_data.data) if sites_data.data else 0}")
+    
     sites = sites_data.data
 
     if not sites:
+        # Дополнительная диагностика
+        all_sites_data = supabase.table('botmonitor_sites').select('id, chat_id').limit(3).execute()
+        logging.info(f"handle_list_command - примеры записей в базе: {all_sites_data.data}")
         await safe_reply_message(message, "📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
         return
 
@@ -1189,7 +1269,7 @@ async def handle_group_mention(message: Message):
     if domain:
         logging.info(f"Получен запрос для конкретного домена: {domain}")
         # Ищем этот сайт в базе данных для текущего чата
-        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check').eq('chat_id', message.chat.id).execute()
+        sites_data = get_sites_by_chat_id_flexible(message.chat.id, 'id, url, original_url, is_up, has_ssl, ssl_expires_at, domain_expires_at, hosting_expires_at, last_check')
         
         found_site = None
         for site in sites_data.data:
@@ -1270,10 +1350,20 @@ async def handle_group_mention(message: Message):
     # Если домен НЕ указан, показываем статус всех сайтов в чате
     else:
         logging.info(f"Получен запрос на статус всех сайтов для чата {message.chat.id}")
-        sites_data = supabase.table('botmonitor_sites').select('id, url, original_url, is_reserve_domain, domain_expires_at, hosting_expires_at').eq('chat_id', message.chat.id).execute()
+        logging.info(f"Тип chat_id: {type(message.chat.id)}, значение: {message.chat.id}")
+        
+        # Используем гибкую функцию поиска
+        sites_data = get_sites_by_chat_id_flexible(message.chat.id, 'id, url, original_url, is_reserve_domain, domain_expires_at, hosting_expires_at')
+        logging.info(f"Результат запроса к Supabase: count={sites_data.count if hasattr(sites_data, 'count') else 'N/A'}, data_length={len(sites_data.data) if sites_data.data else 0}")
+        logging.info(f"Данные из Supabase: {sites_data.data[:2] if sites_data.data else 'Пустой результат'}")  # Показываем первые 2 записи для диагностики
+        
         sites = [(s['id'], s['url'], s['original_url'], s.get('is_reserve_domain', False), s.get('domain_expires_at'), s.get('hosting_expires_at')) for s in sites_data.data]
         
         if not sites:
+            logging.warning(f"Сайты для чата {message.chat.id} не найдены даже через гибкую функцию. Проверяем все записи в базе...")
+            # Дополнительная диагностика - проверим все записи в таблице
+            all_sites_data = supabase.table('botmonitor_sites').select('id, chat_id').limit(5).execute()
+            logging.info(f"Примеры записей в базе (первые 5): {all_sites_data.data}")
             await safe_reply_message(message, "📝 В этом чате нет сайтов для мониторинга. Добавьте сайт командой /add")
             return
             
@@ -1486,11 +1576,14 @@ SITES_FOR_IMPORT = [
 # --- НОВЫЙ БЛОК: Создание клавиатуры и обработка нажатий ---
 
 def get_renewal_keyboard(site_id: int, renewal_type: str) -> InlineKeyboardMarkup:
-    """Создает клавиатуру с кнопками 'Продлён' и 'Ещё не продлён'."""
+    """Создает клавиатуру с кнопками 'Продлён', 'Ещё не продлён' и 'Удалить'."""
     buttons = [
         [
             InlineKeyboardButton(text="✅ Продлён на год", callback_data=f"renew:{renewal_type}:{site_id}"),
             InlineKeyboardButton(text="OK", callback_data=f"snooze:{renewal_type}:{site_id}")
+        ],
+        [
+            InlineKeyboardButton(text="🗑️ Удалить", callback_data=f"delete:{renewal_type}:{site_id}")
         ]
     ]
     keyboard = InlineKeyboardMarkup(inline_keyboard=buttons)
@@ -1546,6 +1639,34 @@ async def handle_snooze_callback(callback: CallbackQuery):
     await callback.message.edit_text(
         f"{callback.message.text}\n\n*OK, вы получили это уведомление.*"
     )
+
+@dp.callback_query(F.data.startswith("delete:"))
+async def handle_delete_callback(callback: CallbackQuery):
+    """Обрабатывает нажатие на кнопку 'Удалить'."""
+    try:
+        _, renewal_type, site_id_str = callback.data.split(":")
+        site_id = int(site_id_str)
+
+        # Получаем информацию о сайте
+        site_data = supabase.table('botmonitor_sites').select('original_url, url').eq('id', site_id).execute()
+        if not site_data.data:
+            await callback.answer("Сайт не найден.", show_alert=True)
+            return
+        
+        site = site_data.data[0]
+        display_url = site['original_url'] if site['original_url'] else site['url']
+        
+        # Удаляем сайт из базы данных
+        supabase.table('botmonitor_sites').delete().eq('id', site_id).execute()
+        
+        # Отвечаем на callback и редактируем сообщение
+        await callback.answer(f"Сайт {display_url} удален из мониторинга.", show_alert=True)
+        await callback.message.edit_text(
+            f"{callback.message.text}\n\n🗑️ **Сайт удален из мониторинга.**"
+        )
+    except Exception as e:
+        logging.error(f"Ошибка в handle_delete_callback: {e}")
+        await callback.answer("Произошла ошибка при удалении.", show_alert=True)
 
 @dp.callback_query(F.data == "show_reserve_domains")
 async def handle_show_reserve_domains_callback(callback: CallbackQuery):
