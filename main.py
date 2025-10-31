@@ -59,6 +59,13 @@ dp = Dispatcher(storage=storage)
 CHECK_INTERVAL = 300  # 5 минут
 SSL_WARNING_DAYS = 30  # Предупреждение о сроке истечения SSL сертификата (в днях) - используется для отображения в списке
 
+# Параметры для повторных проверок перед отправкой уведомления о недоступности
+# Можно настроить через переменные окружения
+DOWN_CHECK_ATTEMPTS = int(os.getenv('DOWN_CHECK_ATTEMPTS', '3'))  # Количество попыток проверки при недоступности
+DOWN_CHECK_INTERVAL = int(os.getenv('DOWN_CHECK_INTERVAL', '10'))  # Интервал между попытками в секундах
+DNS_ERROR_MULTIPLIER = int(os.getenv('DNS_ERROR_MULTIPLIER', '2'))  # Множитель интервала при DNS-ошибках
+ENABLE_ALTERNATIVE_CHECK = os.getenv('ENABLE_ALTERNATIVE_CHECK', 'True') == 'True'  # Включить альтернативные проверки
+
 
 
 
@@ -461,9 +468,16 @@ async def cmd_help(message: Message):
     help_text += "/help - показать эту справку\n\n"
     help_text += "**Особенности:**\n"
     help_text += "• Бот автоматически проверяет сайты каждые 5 минут\n"
+    help_text += "• При недоступности сайта выполняется несколько проверок ({attempts} попыток с интервалом {interval} сек)\n".format(attempts=DOWN_CHECK_ATTEMPTS, interval=DOWN_CHECK_INTERVAL)
     help_text += "• Поддержка кириллических доменов (цифровизируем.рф)\n"
     help_text += "• Автоматическое добавление протокола http:// или https://\n"
-    help_text += "• Проверка SSL сертификатов для HTTPS сайтов"
+    help_text += "• Проверка SSL сертификатов для HTTPS сайтов\n"
+    help_text += "• Настраиваемые параметры через переменные окружения:\n"
+    help_text += f"  - DOWN_CHECK_ATTEMPTS: {DOWN_CHECK_ATTEMPTS} (количество попыток)\n"
+    help_text += f"  - DOWN_CHECK_INTERVAL: {DOWN_CHECK_INTERVAL} сек (интервал между попытками)\n"
+    help_text += f"  - DNS_ERROR_MULTIPLIER: {DNS_ERROR_MULTIPLIER} (множитель интервала при DNS-ошибках)\n"
+    help_text += f"  - ENABLE_ALTERNATIVE_CHECK: {ENABLE_ALTERNATIVE_CHECK} (альтернативные проверки)\n"
+    help_text += "• Умная обработка временных DNS-сбоев для снижения ложных уведомлений"
     
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -517,7 +531,7 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
     
     status_msg = await message.answer(status_msg_text)
     
-    status, status_code = await check_site(url)
+    status, status_code, _ = await check_site_with_retries(url)
     is_up = 1 if status else 0
     
     has_ssl = 0
@@ -762,9 +776,9 @@ async def cmd_status(message: Message):
     for site_id, url, original_url in sites:
         display_url = original_url if original_url else url
 
-        # Проверяем доступность сайта
-        status, status_code = await check_site(url)
-        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code})"
+        # Проверяем доступность сайта с несколькими попытками
+        status, status_code, attempts = await check_site_with_retries(url)
+        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
         site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
 
         # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
@@ -1094,8 +1108,8 @@ async def handle_status_command(message: Message):
         display_url = original_url if original_url else url
 
         # Проверяем доступность сайта
-        status, status_code = await check_site(url)
-        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code})"
+        status, status_code, attempts = await check_site_with_retries(url)
+        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
         site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
 
         # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
@@ -1383,8 +1397,8 @@ async def handle_group_mention(message: Message):
             if is_reserve_domain:
                 continue
             
-            status, status_code = await check_site(url)
-            status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code})"
+            status, status_code, attempts = await check_site_with_retries(url)
+            status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
             site_info = f"**URL:** {display_url}\n**Статус:** {status_str}"
 
             ssl_expires_at = None
@@ -1478,12 +1492,120 @@ async def handle_group_mention(message: Message):
 
 # Функция проверки доступности сайта
 async def check_site(url):
+    """Базовая функция проверки доступности сайта"""
     try:
         async with aiohttp.ClientSession() as session:
             async with session.get(url, timeout=10) as response:
                 return response.status < 400, response.status
-    except Exception:
+    except Exception as e:
+        # Возвращаем информацию об ошибке для лучшей диагностики
+        error_msg = str(e)
+        if "No address associated with hostname" in error_msg or "Temporary failure in name resolution" in error_msg:
+            logging.warning(f"DNS ошибка при проверке {url}: {error_msg}")
         return False, 0
+
+async def check_site_alternative(url):
+    """Альтернативная функция проверки через другой метод (для подтверждения)"""
+    import subprocess
+    import re
+    
+    try:
+        # Извлекаем домен из URL
+        from urllib.parse import urlparse
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        # Пробуем ping (только для подтверждения DNS-резолвинга)
+        try:
+            # Используем ping с таймаутом 5 секунд и 1 пакетом
+            result = subprocess.run(['ping', '-c', '1', '-W', '5', domain],
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0:
+                # Ping прошел успешно, значит DNS работает
+                logging.info(f"Альтернативная проверка {url}: ping успешен")
+                return True, "ping_success"
+            else:
+                logging.warning(f"Альтернативная проверка {url}: ping неуспешен")
+                return False, "ping_failed"
+        except subprocess.TimeoutExpired:
+            logging.warning(f"Альтернативная проверка {url}: ping таймаут")
+            return False, "ping_timeout"
+        except Exception as e:
+            logging.warning(f"Альтернативная проверка {url}: ошибка ping - {e}")
+            
+        # Если ping не сработал, пробуем nslookup
+        try:
+            result = subprocess.run(['nslookup', domain],
+                                  capture_output=True, text=True, timeout=10)
+            
+            if result.returncode == 0 and "Address:" in result.stdout:
+                logging.info(f"Альтернативная проверка {url}: DNS резолвинг успешен")
+                return True, "dns_success"
+            else:
+                logging.warning(f"Альтернативная проверка {url}: DNS резолвинг неуспешен")
+                return False, "dns_failed"
+        except Exception as e:
+            logging.warning(f"Альтернативная проверка {url}: ошибка nslookup - {e}")
+            return False, "dns_error"
+            
+    except Exception as e:
+        logging.error(f"Ошибка в альтернативной проверке {url}: {e}")
+        return False, "error"
+
+async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_interval=DOWN_CHECK_INTERVAL):
+    """
+    Улучшенная функция проверки доступности сайта с несколькими попытками.
+    
+    Args:
+        url: URL сайта для проверки
+        max_attempts: Максимальное количество попыток
+        retry_interval: Интервал между попытками в секундах
+    
+    Returns:
+        tuple: (is_available, status_code, attempts_made)
+    """
+    attempts = 0
+    last_status_code = 0
+    dns_errors_count = 0
+    
+    while attempts < max_attempts:
+        attempts += 1
+        is_available, status_code = await check_site(url)
+        last_status_code = status_code
+        
+        # Если сайт доступен, возвращаем результат сразу
+        if is_available:
+            logging.info(f"Сайт {url} доступен с попытки {attempts} (статус: {status_code})")
+            return True, status_code, attempts
+        
+        # Проверяем тип ошибки
+        error_msg = str(status_code)  # В нашем случае 0 означает ошибку
+        if status_code == 0:
+            # Это ошибка подключения/DNS
+            dns_errors_count += 1
+            
+            # Если это DNS-ошибка и у нас еще есть попытки, делаем дополнительную проверку
+            if dns_errors_count >= 2 and attempts < max_attempts and ENABLE_ALTERNATIVE_CHECK:
+                logging.info(f"Обнаружены множественные DNS-ошибки для {url}, выполняю альтернативную проверку...")
+                alt_available, alt_result = await check_site_alternative(url)
+                
+                if alt_available:
+                    logging.info(f"Альтернативная проверка подтвердила доступность {url} ({alt_result})")
+                    return True, 200, attempts
+                else:
+                    logging.warning(f"Альтернативная проверка подтвердила недоступность {url} ({alt_result})")
+        
+        # Если сайт недоступен и это не последняя попытка, ждем перед следующей проверкой
+        if attempts < max_attempts:
+            # Увеличиваем интервал между попытками при DNS-ошибках
+            current_interval = retry_interval * (DNS_ERROR_MULTIPLIER if dns_errors_count > 0 else 1)
+            logging.info(f"Сайт {url} недоступен (статус: {status_code}), попытка {attempts}/{max_attempts}, повторная проверка через {current_interval} сек")
+            await asyncio.sleep(current_interval)
+    
+    # Если все попытки неудачны
+    logging.warning(f"Сайт {url} недоступен после {attempts} попыток (последний статус: {last_status_code}, DNS-ошибок: {dns_errors_count})")
+    return False, last_status_code, attempts
 
 
 # --- НОВЫЙ БЛОК: Данные для массового импорта ---
@@ -1749,8 +1871,8 @@ async def scheduled_availability_check():
                 was_up, had_ssl, old_ssl_expires_at = site['is_up'], site['has_ssl'], site['ssl_expires_at']
                 now = datetime.now(timezone.utc)
 
-                # 1. Проверяем доступность
-                status, status_code = await check_site(url)
+                # 1. Проверяем доступность с несколькими попытками
+                status, status_code, attempts = await check_site_with_retries(url)
                 status_changed = status != bool(was_up)
 
                 # 2. Проверяем SSL (только для обновления данных, без уведомлений)
@@ -1771,7 +1893,11 @@ async def scheduled_availability_check():
 
                 # 3. Отправляем уведомления о доступности (только для нерезервных доменов)
                 if status_changed and not site.get('is_reserve_domain', False):
-                    message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}" if status else f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}"
+                    if status:
+                        message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}"
+                    else:
+                        # Добавляем информацию о количестве попыток при недоступности
+                        message = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nПроверок выполнено: {attempts}/{DOWN_CHECK_ATTEMPTS}"
                     await send_notification(chat_id, message)
 
         except Exception as e:
