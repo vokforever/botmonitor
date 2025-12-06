@@ -466,18 +466,25 @@ async def cmd_help(message: Message):
     help_text += "/screenshot [ID/URL] - сделать скриншот сайта\n"
     help_text += "/diagnose - диагностика ScreenshotMachine API\n"
     help_text += "/help - показать эту справку\n\n"
-    help_text += "**Особенности:**\n"
-    help_text += "• Бот автоматически проверяет сайты каждые 5 минут\n"
-    help_text += "• При недоступности сайта выполняется несколько проверок ({attempts} попыток с интервалом {interval} сек)\n".format(attempts=DOWN_CHECK_ATTEMPTS, interval=DOWN_CHECK_INTERVAL)
+    
+    help_text += "**Что проверяет бот:**\n"
+    help_text += "✅ **Доступность сайта** - уведомление если два раза подряд недоступен\n"
+    help_text += "⏱️ **Время ответа** - отслеживание и уведомление при резком увеличении\n"
+    help_text += "🔢 **Код ответа HTTP** - уведомление при изменении (200→404 и т.д.)\n"
+    help_text += "🔒 **SSL сертификат** - срок действия и валидность\n"
+    help_text += "📝 **Заголовок страницы** - обнаружение заглушек типа 'Оплатите хостинг'\n"
+    help_text += "🔄 **Переадресация** - отслеживание конечного URL (до 7 редиректов)\n"
+    help_text += "📆 **Срок домена и хостинга** - напоминания о продлении\n"
+    help_text += "📊 **Uptime** - статистика доступности сайта\n\n"
+    
+    help_text += "**Технические детали:**\n"
+    help_text += "• Автоматические проверки каждые **5-10 минут** (рандомизировано)\n"
+    help_text += f"• При недоступности выполняется {DOWN_CHECK_ATTEMPTS} попытки с интервалом {DOWN_CHECK_INTERVAL} сек\n"
+    help_text += "• Таймаут проверки: 10 секунд\n"
+    help_text += "• UserAgent: `vokforever_site_monitor_bot`\n"
     help_text += "• Поддержка кириллических доменов (цифровизируем.рф)\n"
-    help_text += "• Автоматическое добавление протокола http:// или https://\n"
-    help_text += "• Проверка SSL сертификатов для HTTPS сайтов\n"
-    help_text += "• Настраиваемые параметры через переменные окружения:\n"
-    help_text += f"  - DOWN_CHECK_ATTEMPTS: {DOWN_CHECK_ATTEMPTS} (количество попыток)\n"
-    help_text += f"  - DOWN_CHECK_INTERVAL: {DOWN_CHECK_INTERVAL} сек (интервал между попытками)\n"
-    help_text += f"  - DNS_ERROR_MULTIPLIER: {DNS_ERROR_MULTIPLIER} (множитель интервала при DNS-ошибках)\n"
-    help_text += f"  - ENABLE_ALTERNATIVE_CHECK: {ENABLE_ALTERNATIVE_CHECK} (альтернативные проверки)\n"
-    help_text += "• Умная обработка временных DNS-сбоев для снижения ложных уведомлений"
+    help_text += "• Умная обработка временных DNS-сбоев\n"
+    help_text += "• Расчет среднего времени ответа и uptime"
     
     await message.answer(help_text, parse_mode="Markdown")
 
@@ -531,7 +538,8 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
     
     status_msg = await message.answer(status_msg_text)
     
-    status, status_code, _ = await check_site_with_retries(url)
+    # Получаем расширенные данные о проверке
+    status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
     is_up = 1 if status else 0
     
     has_ssl = 0
@@ -559,22 +567,34 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
     punycode_info = ""
     if url != original_url and "xn--" in url:
         punycode_info = f"\nПреобразовано в: {url}"
+    
+    # Информация о времени ответа
+    response_info = ""
+    if status and response_time > 0:
+        response_info = f"\n⏱️ Время ответа: {response_time:.2f}с"
 
     payload = {
         'user_id': message.from_user.id,
         'chat_id': message.chat.id,
         'chat_type': message.chat.type,
         'is_up': is_up,
+        'status_code': status_code,
+        'response_time': response_time if response_time > 0 else None,
+        'avg_response_time': response_time if response_time > 0 else None,  # Начальное значение
+        'page_title': page_title,
+        'final_url': final_url,
         'has_ssl': has_ssl,
         'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
-        'last_check': datetime.now(timezone.utc).isoformat()
+        'last_check': datetime.now(timezone.utc).isoformat(),
+        'total_checks': 1,
+        'successful_checks': 1 if status else 0
     }
 
     if existing_site:
         # 2. САЙТ НАЙДЕН -> ВЫПОЛНЯЕМ UPDATE
         supabase.table('botmonitor_sites').update(payload).eq('id', existing_site['id']).execute()
         
-        final_message = f"✅ Сайт {original_url} был **перемещен** в этот чат.\nТекущий статус: {'доступен' if status else 'недоступен'} (код {status_code}).{punycode_info}{ssl_message}"
+        final_message = f"✅ Сайт {original_url} был **перемещен** в этот чат.\nТекущий статус: {'доступен' if status else 'недоступен'} (код {status_code}).{response_info}{punycode_info}{ssl_message}"
         await bot.edit_message_text(final_message, chat_id=message.chat.id, message_id=status_msg.message_id)
 
     else:
@@ -584,8 +604,9 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
         
         supabase.table('botmonitor_sites').insert(payload).execute()
         
-        final_message = f"✅ Сайт {original_url} **добавлен** в мониторинг.\nСтатус: {'доступен' if status else 'недоступен'} (код {status_code}).{punycode_info}{ssl_message}"
+        final_message = f"✅ Сайт {original_url} **добавлен** в мониторинг.\nСтатус: {'доступен' if status else 'недоступен'} (код {status_code}).{response_info}{punycode_info}{ssl_message}"
         await bot.edit_message_text(final_message, chat_id=message.chat.id, message_id=status_msg.message_id)
+
 
 
 # Обработчик команды /reserve - переключение статуса резервного домена
@@ -776,10 +797,14 @@ async def cmd_status(message: Message):
     for site_id, url, original_url in sites:
         display_url = original_url if original_url else url
 
-        # Проверяем доступность сайта с несколькими попытками
-        status, status_code, attempts = await check_site_with_retries(url)
+        # Проверяем доступность сайта с несколькими попытками - получаем расширенные данные
+        status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
         status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
         site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
+        
+        # Добавляем время ответа
+        if status and response_time > 0:
+            site_info += f"\n⏱️ Время ответа: {response_time:.2f}с"
 
         # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
         ssl_info = None
@@ -807,9 +832,13 @@ async def cmd_status(message: Message):
 
         results.append(site_info)
 
-        # Обновляем статус в БД
+        # Обновляем статус в БД с расширенными данными
         supabase.table('botmonitor_sites').update({
             'is_up': status,
+            'status_code': status_code,
+            'response_time': response_time if response_time > 0 else None,
+            'page_title': page_title,
+            'final_url': final_url,
             'has_ssl': has_ssl,
             'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
             'last_check': datetime.now(timezone.utc).isoformat()
@@ -1492,17 +1521,62 @@ async def handle_group_mention(message: Message):
 
 # Функция проверки доступности сайта
 async def check_site(url):
-    """Базовая функция проверки доступности сайта"""
+    """
+    Улучшенная функция проверки доступности сайта с расширенной диагностикой.
+    
+    Returns:
+        tuple: (is_available, status_code, response_time, page_title, final_url)
+    """
+    import time
     try:
-        async with aiohttp.ClientSession() as session:
-            async with session.get(url, timeout=10) as response:
-                return response.status < 400, response.status
-    except Exception as e:
-        # Возвращаем информацию об ошибке для лучшей диагностики
+        # Настраиваем ClientSession с custom User-Agent и поддержкой редиректов
+        headers = {
+            'User-Agent': 'vokforever_site_monitor_bot'
+        }
+        
+        # Начинаем замер времени
+        start_time = time.time()
+        
+        timeout = aiohttp.ClientTimeout(total=10)
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            # allow_redirects=True по умолчанию, max_redirects=10 по умолчанию
+            # Устанавливаем max_redirects=7 как у конкурента
+            async with session.get(url, allow_redirects=True, max_redirects=7) as response:
+                # Замеряем время ответа
+                response_time = time.time() - start_time
+                
+                # Получаем финальный URL после редиректов
+                final_url = str(response.url)
+                
+                # Получаем заголовок страницы
+                page_title = None
+                if response.status < 400:
+                    try:
+                        html_content = await response.text()
+                        # Простой парсинг заголовка из HTML
+                        import re
+                        title_match = re.search(r'<title[^>]*>([^<]+)</title>', html_content, re.IGNORECASE)
+                        if title_match:
+                            page_title = title_match.group(1).strip()
+                    except Exception as title_error:
+                        logging.debug(f"Не удалось извлечь заголовок для {url}: {title_error}")
+                
+                is_available = response.status < 400
+                return is_available, response.status, response_time, page_title, final_url
+                
+    except asyncio.TimeoutError:
+        logging.warning(f"Таймаут при проверке {url}")
+        return False, 0, 10.0, None, url
+    except aiohttp.ClientError as e:
         error_msg = str(e)
         if "No address associated with hostname" in error_msg or "Temporary failure in name resolution" in error_msg:
             logging.warning(f"DNS ошибка при проверке {url}: {error_msg}")
-        return False, 0
+        else:
+            logging.warning(f"Ошибка подключения к {url}: {error_msg}")
+        return False, 0, 0.0, None, url
+    except Exception as e:
+        logging.error(f"Неожиданная ошибка при проверке {url}: {e}")
+        return False, 0, 0.0, None, url
 
 async def check_site_alternative(url):
     """Альтернативная функция проверки через другой метод (для подтверждения)"""
@@ -1563,24 +1637,29 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
         retry_interval: Интервал между попытками в секундах
     
     Returns:
-        tuple: (is_available, status_code, attempts_made)
+        tuple: (is_available, status_code, attempts_made, response_time, page_title, final_url)
     """
     attempts = 0
     last_status_code = 0
     dns_errors_count = 0
+    last_response_time = 0.0
+    last_page_title = None
+    last_final_url = url
     
     while attempts < max_attempts:
         attempts += 1
-        is_available, status_code = await check_site(url)
+        is_available, status_code, response_time, page_title, final_url = await check_site(url)
         last_status_code = status_code
+        last_response_time = response_time
+        last_page_title = page_title
+        last_final_url = final_url
         
         # Если сайт доступен, возвращаем результат сразу
         if is_available:
-            logging.info(f"Сайт {url} доступен с попытки {attempts} (статус: {status_code})")
-            return True, status_code, attempts
+            logging.info(f"Сайт {url} доступен с попытки {attempts} (статус: {status_code}, время: {response_time:.2f}s)")
+            return True, status_code, attempts, response_time, page_title, final_url
         
         # Проверяем тип ошибки
-        error_msg = str(status_code)  # В нашем случае 0 означает ошибку
         if status_code == 0:
             # Это ошибка подключения/DNS
             dns_errors_count += 1
@@ -1592,7 +1671,8 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
                 
                 if alt_available:
                     logging.info(f"Альтернативная проверка подтвердила доступность {url} ({alt_result})")
-                    return True, 200, attempts
+                    # Возвращаем успешный результат с данными последней проверки
+                    return True, 200, attempts, last_response_time, last_page_title, last_final_url
                 else:
                     logging.warning(f"Альтернативная проверка подтвердила недоступность {url} ({alt_result})")
         
@@ -1605,7 +1685,7 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
     
     # Если все попытки неудачны
     logging.warning(f"Сайт {url} недоступен после {attempts} попыток (последний статус: {last_status_code}, DNS-ошибок: {dns_errors_count})")
-    return False, last_status_code, attempts
+    return False, last_status_code, attempts, last_response_time, last_page_title, last_final_url
 
 
 # --- НОВЫЙ БЛОК: Данные для массового импорта ---
@@ -1932,7 +2012,7 @@ async def scheduled_availability_check():
             # Безопасное получение списка сайтов с повторными попытками
             success, sites_result = await safe_supabase_operation(
                 lambda: supabase.table('botmonitor_sites').select(
-                    'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, is_reserve_domain'
+                    'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, is_reserve_domain, status_code, response_time, avg_response_time, page_title, final_url, total_checks, successful_checks'
                 ).execute()
             )
             
@@ -1955,12 +2035,37 @@ async def scheduled_availability_check():
                     chat_id = site['chat_id']
                     display_url = site['original_url'] or site['url']
                     site_id, url, original_url = site['id'], site['url'], site['original_url']
-                    was_up, had_ssl, old_ssl_expires_at = site['is_up'], site['has_ssl'], site['ssl_expires_at']
+                    
+                    # Получаем старые значения для отслеживания изменений
+                    was_up = site['is_up']
+                    had_ssl = site['has_ssl']
+                    old_ssl_expires_at = site['ssl_expires_at']
+                    old_status_code = site.get('status_code')
+                    old_page_title = site.get('page_title')
+                    old_final_url = site.get('final_url')
+                    old_avg_response_time = site.get('avg_response_time', 0.0) or 0.0
+                    total_checks = site.get('total_checks', 0) or 0
+                    successful_checks = site.get('successful_checks', 0) or 0
+                    
                     now = datetime.now(timezone.utc)
 
-                    # 1. Проверяем доступность с несколькими попытками
-                    status, status_code, attempts = await check_site_with_retries(url)
+                    # 1. Проверяем доступность с несколькими попытками - получаем расширенные данные
+                    status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
                     status_changed = status != bool(was_up)
+                    
+                    # Обновляем счетчики
+                    total_checks += 1
+                    if status:
+                        successful_checks += 1
+                    
+                    # Вычисляем среднее время ответа (скользящее среднее)
+                    if response_time > 0:
+                        if old_avg_response_time > 0:
+                            new_avg_response_time = (old_avg_response_time * 0.8) + (response_time * 0.2)
+                        else:
+                            new_avg_response_time = response_time
+                    else:
+                        new_avg_response_time = old_avg_response_time
 
                     # 2. Проверяем SSL (только для обновления данных, без уведомлений)
                     has_ssl, ssl_info, ssl_expires_at = False, None, old_ssl_expires_at
@@ -1970,13 +2075,21 @@ async def scheduled_availability_check():
                         if has_ssl:
                             ssl_expires_at = ssl_info.get('expiry_date')
 
-                    # 3. Безопасное обновление статуса в БД
+                    # 3. Безопасное обновление статуса в БД с расширенными данными
                     update_success, update_result = await safe_supabase_operation(
                         lambda: supabase.table('botmonitor_sites').update({
                             'is_up': status,
+                            'status_code': status_code,
+                            'response_time': response_time if response_time > 0 else None,
+                            'avg_response_time': new_avg_response_time if new_avg_response_time > 0 else None,
+                            'page_title': page_title,
+                            'final_url': final_url,
                             'has_ssl': has_ssl,
                             'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at and hasattr(ssl_expires_at, 'isoformat') else ssl_expires_at,
-                            'last_check': now.isoformat()
+                            'last_check': now.isoformat(),
+                            'last_status_change': now.isoformat() if status_changed else site.get('last_status_change'),
+                            'total_checks': total_checks,
+                            'successful_checks': successful_checks
                         }).eq('id', site_id).execute()
                     )
                     
@@ -1985,18 +2098,49 @@ async def scheduled_availability_check():
                         await send_admin_notification(f"Ошибка обновления сайта {display_url}: {update_result}")
                         continue
 
-                    # 4. Отправляем уведомления о доступности (только для нерезервных доменов)
-                    if status_changed and not site.get('is_reserve_domain', False):
-                        if status:
-                            message = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}"
-                        else:
-                            # Добавляем информацию о количестве попыток при недоступности
-                            message = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nПроверок выполнено: {attempts}/{DOWN_CHECK_ATTEMPTS}"
+                    # 4. Отправляем уведомления (только для нерезервных доменов)
+                    if not site.get('is_reserve_domain', False):
+                        notifications = []
                         
-                        try:
-                            await send_notification(chat_id, message)
-                        except Exception as notify_error:
-                            logging.error(f"Ошибка отправки уведомления для сайта {site_id}: {notify_error}")
+                        # Изменение доступности
+                        if status_changed:
+                            if status:
+                                msg = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}"
+                                if response_time > 0:
+                                    msg += f"\n⏱️ Время ответа: {response_time:.2f}с"
+                                notifications.append(msg)
+                            else:
+                                msg = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nПроверок выполнено: {attempts}/{DOWN_CHECK_ATTEMPTS}"
+                                notifications.append(msg)
+                        
+                        # Изменение кода ответа (без изменения доступности)
+                        elif status and old_status_code and status_code != old_status_code:
+                            msg = f"ℹ️ Изменился код ответа сайта\nURL: {display_url}\nБыло: {old_status_code} → Стало: {status_code}"
+                            notifications.append(msg)
+                        
+                        # Изменение заголовка страницы
+                        if status and page_title and old_page_title and page_title != old_page_title:
+                            msg = f"📝 Изменился заголовок страницы\nURL: {display_url}\nБыло: {old_page_title}\nСтало: {page_title}"
+                            notifications.append(msg)
+                        
+                        # Изменение конечного URL (редирект)
+                        if status and final_url and old_final_url and final_url != old_final_url:
+                            msg = f"🔄 Изменился конечный URL\nURL: {display_url}\nБыло: {old_final_url}\nСтало: {final_url}"
+                            notifications.append(msg)
+                        
+                        # Значительное увеличение времени ответа (в 2 раза)
+                        if status and response_time > 0 and old_avg_response_time > 0:
+                            if response_time > (old_avg_response_time * 2) and response_time > 3.0:  # Только если >3 сек
+                                msg = f"⚠️ Значительное увеличение времени ответа\nURL: {display_url}\nОбычно: {old_avg_response_time:.2f}с → Сейчас: {response_time:.2f}с"
+                                notifications.append(msg)
+                        
+                        # Отправляем все уведомления
+                        for notification in notifications:
+                            try:
+                                await send_notification(chat_id, notification)
+                                await asyncio.sleep(0.5)  # Небольшая задержка между уведомлениями
+                            except Exception as notify_error:
+                                logging.error(f"Ошибка отправки уведомления для сайта {site_id}: {notify_error}")
                 
                 except Exception as site_error:
                     logging.error(f"Ошибка при обработке сайта {site.get('id', 'unknown')}: {site_error}")
@@ -2015,7 +2159,11 @@ async def scheduled_availability_check():
             
             await send_admin_notification(f"Критическая ошибка в availability check: {error_msg}")
         
-        await asyncio.sleep(CHECK_INTERVAL)
+        # Используем рандомизированный интервал 5-10 минут как у конкурента
+        import random
+        random_interval = random.randint(300, 600)  # 5-10 минут в секундах
+        logging.info(f"Следующая проверка через {random_interval} секунд ({random_interval//60} мин {random_interval%60} сек)")
+        await asyncio.sleep(random_interval)
 
 # Функция проверки уведомлений о сроках истечения (один раз в день)
 async def scheduled_notification_check():
