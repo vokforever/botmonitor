@@ -2400,13 +2400,24 @@ async def main():
     logging.info("Running ScreenshotMachine API diagnosis on startup...")
     api_ok = await diagnose_api()
     
+    # Получаем локальное время (UTC+3 для Москвы)
+    from datetime import timedelta
+    moscow_time = datetime.now(timezone.utc) + timedelta(hours=3)
+    
     # Отправляем уведомление админу о запуске
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
-                     f"⏰ Время запуска: {datetime.now(timezone.utc).strftime('%Y-%m-%d %H:%M:%S')}\n" \
+                     f"⏰ Время запуска: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}\n" \
                      f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
                      f"📊 Сайтов в базе проверки: {sites_count}\n" \
                      f"📸 ScreenshotMachine API: {'✅ OK' if api_ok else '❌ Ошибка'}"
     await send_admin_notification(startup_message)
+    
+    # Также выводим в лог
+    logging.info("🚀 Бот мониторинга сайтов запущен!")
+    logging.info(f"⏰ Время запуска: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}")
+    logging.info(f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут")
+    logging.info(f"📊 Сайтов в базе проверки: {sites_count}")
+    logging.info(f"📸 ScreenshotMachine API: {'✅ OK' if api_ok else '❌ Ошибка'}")
     
     # Запускаем задачу проверки сайтов при старте
     await on_startup()
