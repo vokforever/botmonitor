@@ -23,12 +23,16 @@ from dotenv import load_dotenv
 from supabase import create_client, Client
 from urllib.parse import urlparse
 import whois_integration  # Импортируем модуль WHOIS интеграции
-from whois_watchdog import get_whois_expiry_date  # Импортируем функцию для получения WHOIS данных
+from whois_watchdog import get_whois_expiry_date, extract_domain_from_url  # Импортируем функцию для получения WHOIS данных и извлечения домена
 from utils import safe_supabase_operation, send_admin_notification  # Импортируем общие функции
 
 # Исправление для Windows Proactor event loop предупреждения
 if sys.platform == "win32":
     asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
+# Фильтруем предупреждения от curl_cffi
+import warnings
+warnings.filterwarnings("ignore", message=".*Curlm alread closed.*", module="curl_cffi")
 
 try:
     from curl_cffi import requests as curl_requests
@@ -546,7 +550,7 @@ async def cmd_start(message: Message):
         "👋 Привет! Я бот для мониторинга доступности сайтов.\n\n"
         "Команды:\n"
         "/add - добавить сайт для мониторинга\n"
-        "/list - показать список отслеживаемых сайтов\n"
+        "/list - показать список отслеживаемых сайтов (с автоматическим обновлением WHOIS)\n"
         "/remove - удалить сайт из мониторинга\n"
         "/status - проверить статус всех сайтов\n"
         "/reserve ID - переключить сайт в режим резервного домена\n"
@@ -580,7 +584,7 @@ async def cmd_help(message: Message):
     
     help_text += "**Команды:**\n"
     help_text += "/add [URL] - добавить новый сайт для мониторинга\n"
-    help_text += "/list - показать список всех отслеживаемых сайтов\n"
+    help_text += "/list - показать список всех отслеживаемых сайтов (с автоматическим обновлением WHOIS)\n"
     help_text += "/remove [ID] - удалить сайт из мониторинга\n"
     help_text += "/status - выполнить проверку статуса всех сайтов\n"
     help_text += "/reserve [ID] - переключить сайт в режим резервного домена\n"
@@ -845,39 +849,110 @@ async def cmd_list(message: Message):
     # Отправляем сообщение о начале проверки
     status_msg = await message.answer("🔄 Проверяю WHOIS данные для доменов...")
     
-    # Проверяем и обновляем WHOIS данные для сайтов без даты истечения домена
+    # Проверяем и обновляем WHOIS данные для сайтов
     whois_updated_count = 0
+    whois_added_count = 0
+    whois_error_count = 0
+    
     for site in sites:
-        if not site.get('domain_expires_at'):
-            url = site['url']
-            original_url = site.get('original_url', url)
-            domain = extract_domain_from_url(original_url)
+        url = site['url']
+        original_url = site.get('original_url', url)
+        domain = extract_domain_from_url(original_url)
+        
+        # Проверяем WHOIS для всех сайтов, а не только для тех, у кого нет даты
+        # Это позволит обнаружить продление доменов
+        try:
+            # Получаем дату истечения через WHOIS
+            expiry_date = await get_whois_expiry_date(domain)
             
-            try:
-                # Получаем дату истечения через WHOIS
-                expiry_date = await get_whois_expiry_date(domain)
+            if expiry_date:
+                expiry_date_str = expiry_date.date().isoformat()
+                current_domain_date = site.get('domain_expires_at')
                 
-                if expiry_date:
+                # Если даты нет или она отличается от WHOIS
+                if not current_domain_date or current_domain_date != expiry_date_str:
                     # Обновляем дату в основной таблице
                     update_success, _ = await safe_supabase_operation(
                         lambda: supabase.table('botmonitor_sites').update({
-                            'domain_expires_at': expiry_date.date().isoformat()
+                            'domain_expires_at': expiry_date_str
                         }).eq('id', site['id']).execute(),
                         operation_name=f"update_domain_expiry_from_list_{site['id']}"
                     )
                     
                     if update_success:
-                        whois_updated_count += 1
+                        if not current_domain_date:
+                            whois_added_count += 1
+                            logging.info(f"Добавлена дата домена {domain} из WHOIS: {expiry_date_str}")
+                        else:
+                            whois_updated_count += 1
+                            logging.info(f"Обновлена дата домена {domain} с {current_domain_date} на {expiry_date_str}")
+                        
                         # Обновляем данные в локальном массиве
-                        site['domain_expires_at'] = expiry_date.date().isoformat()
-                        logging.info(f"Обновлена дата домена {domain} из WHOIS")
-            except Exception as e:
-                logging.error(f"Ошибка при получении WHOIS для домена {domain}: {e}")
+                        site['domain_expires_at'] = expiry_date_str
+                        
+                        # Проверяем, есть ли домен в WHOIS мониторинге
+                        domain_exists_result = await safe_supabase_operation(
+                            lambda: supabase.table('botmonitor_domain_monitor').select('id').eq('domain_name', domain).execute(),
+                            operation_name=f"check_domain_exists_{domain}"
+                        )
+                        
+                        if domain_exists_result[0] and not domain_exists_result[1].data:
+                            # Добавляем в WHOIS мониторинг, если там еще нет
+                            whois_success, whois_result = await safe_supabase_operation(
+                                lambda: supabase.table('botmonitor_domain_monitor').insert({
+                                    'domain_name': domain,
+                                    'current_expiry_date': expiry_date_str,
+                                    'admin_chat_id': site['chat_id'],
+                                    'project_chat_id': site['chat_id'],
+                                    'is_reserve_domain': site.get('is_reserve_domain', False),
+                                    'last_check_date': datetime.now(timezone.utc).isoformat()
+                                }).execute(),
+                                operation_name=f"auto_add_domain_{domain}"
+                            )
+                            
+                            if whois_success:
+                                logging.info(f"Добавлен домен {domain} в WHOIS мониторинг")
+                            else:
+                                logging.error(f"Ошибка добавления домена {domain} в WHOIS мониторинг: {whois_result}")
+                        elif domain_exists_result[0] and domain_exists_result[1].data:
+                            # Обновляем дату в WHOIS мониторинге, если домен уже там
+                            whois_success, whois_result = await safe_supabase_operation(
+                                lambda: supabase.table('botmonitor_domain_monitor').update({
+                                    'current_expiry_date': expiry_date_str,
+                                    'last_check_date': datetime.now(timezone.utc).isoformat()
+                                }).eq('domain_name', domain).execute(),
+                                operation_name=f"update_domain_expiry_whois_{domain}"
+                            )
+                            
+                            if whois_success:
+                                logging.info(f"Обновлена дата домена {domain} в WHOIS мониторинге")
+                            else:
+                                logging.error(f"Ошибка обновления даты домена {domain} в WHOIS мониторинге: {whois_result}")
+                    else:
+                        whois_error_count += 1
+                        logging.error(f"Ошибка обновления даты домена {domain} в основной таблице")
+            else:
+                logging.warning(f"Не удалось получить WHOIS данные для домена {domain}")
+                whois_error_count += 1
+                
+        except Exception as e:
+            logging.error(f"Ошибка при обработке WHOIS для домена {domain}: {e}")
+            whois_error_count += 1
     
-    if whois_updated_count > 0:
-        await status_msg.edit_text(f"🔄 Обновлено {whois_updated_count} дат доменов из WHOIS. Формирую список...")
-    else:
-        await status_msg.edit_text("🔄 Формирую список сайтов...")
+    # Формируем информативное сообщение о результате
+    status_text = "🔄 Формирую список сайтов..."
+    if whois_added_count > 0 or whois_updated_count > 0 or whois_error_count > 0:
+        status_parts = []
+        if whois_added_count > 0:
+            status_parts.append(f"добавлено: {whois_added_count}")
+        if whois_updated_count > 0:
+            status_parts.append(f"обновлено: {whois_updated_count}")
+        if whois_error_count > 0:
+            status_parts.append(f"ошибок: {whois_error_count}")
+        
+        status_text = f"🔄 WHOIS проверка завершена. {' | '.join(status_parts)}. Формирую список..."
+    
+    await status_msg.edit_text(status_text)
 
     response = "📝 Список отслеживаемых сайтов:\n\n"
     for site in sites:
@@ -918,16 +993,24 @@ async def cmd_list(message: Message):
         elif url.startswith('https://'):
             site_info += "❌ SSL сертификат не проверен\n"
 
+        # Добавляем информацию о WHOIS
+        site_info += "🔍 WHOIS: "
+        if domain_expires_at:
+            domain_date = datetime.fromisoformat(domain_expires_at).date()
+            site_info += f"Домен до {domain_date.strftime('%d.%m.%Y')}\n"
+        else:
+            site_info += "дата не установлена\n"
+        
         # Добавляем информацию о датах истечения домена и хостинга
         if domain_expires_at:
             domain_date = datetime.fromisoformat(domain_expires_at).date()
             domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
             if domain_days_left <= 0:
-                domain_status = f"⚠️ Домен истёк! ({domain_date.strftime('%d.%m.%Y')})"
+                domain_status = f"⚠️ истёк! ({domain_date.strftime('%d.%m.%Y')})"
             elif domain_days_left <= 30:
-                domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                domain_status = f"⚠️ истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
             else:
-                domain_status = f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+                domain_status = f"установлен вручную - до {domain_date.strftime('%d.%m.%Y')}"
             site_info += f"Домен: {domain_status}\n"
         else:
             site_info += "Домен: дата не установлена (используйте /autowhois для обновления)\n"
@@ -949,9 +1032,15 @@ async def cmd_list(message: Message):
         response += site_info
 
     # Добавляем информацию об обновлении WHOIS если были изменения
-    if whois_updated_count > 0:
-        response += f"\n🔄 **Обновлено {whois_updated_count} дат доменов из WHOIS**\n"
-        response += "Используйте /autowhois для обновления всех доменов"
+    if whois_added_count > 0 or whois_updated_count > 0 or whois_error_count > 0:
+        response += f"\n🔄 **Обновление WHOIS:**\n"
+        if whois_added_count > 0:
+            response += f"• Добавлено дат доменов: {whois_added_count}\n"
+        if whois_updated_count > 0:
+            response += f"• Обновлено дат доменов: {whois_updated_count}\n"
+        if whois_error_count > 0:
+            response += f"• Ошибок при получении WHOIS: {whois_error_count}\n"
+        response += "Используйте /autowhois для принудительного обновления всех доменов"
 
     await message.answer(response)
 
@@ -1362,16 +1451,24 @@ async def handle_list_command(message: Message):
         elif url.startswith('https://'):
             site_info += "❌ SSL сертификат не проверен\n"
 
+        # Добавляем информацию о WHOIS
+        site_info += "🔍 WHOIS: "
+        if domain_expires_at:
+            domain_date = datetime.fromisoformat(domain_expires_at).date()
+            site_info += f"Домен до {domain_date.strftime('%d.%m.%Y')}\n"
+        else:
+            site_info += "дата не установлена\n"
+        
         # Добавляем информацию о датах истечения домена и хостинга
         if domain_expires_at:
             domain_date = datetime.fromisoformat(domain_expires_at).date()
             domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
             if domain_days_left <= 0:
-                domain_status = f"⚠️ Домен истёк! ({domain_date.strftime('%d.%m.%Y')})"
+                domain_status = f"⚠️ истёк! ({domain_date.strftime('%d.%m.%Y')})"
             elif domain_days_left <= 30:
-                domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                domain_status = f"⚠️ истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
             else:
-                domain_status = f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+                domain_status = f"установлен вручную - до {domain_date.strftime('%d.%m.%Y')}"
             site_info += f"Домен: {domain_status}\n"
         else:
             site_info += "Домен: дата не установлена\n"
@@ -1485,16 +1582,24 @@ async def handle_group_mention(message: Message):
         elif site_url.startswith('https://'):
             response_text += "**SSL:** ❌ Сертификат не найден или недействителен\n"
         
+        # Добавляем информацию о WHOIS
+        response_text += "**🔍 WHOIS:** "
+        if domain_expires_at:
+            domain_date = datetime.fromisoformat(domain_expires_at).date()
+            response_text += f"Домен до {domain_date.strftime('%d.%m.%Y')}\n"
+        else:
+            response_text += "дата не установлена\n"
+        
         # Добавляем информацию о сроках окончания домена
         if domain_expires_at:
             domain_date = datetime.fromisoformat(domain_expires_at).date()
             domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
             if domain_days_left <= 0:
-                domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                domain_status = f"⚠️ **истёк!** ({domain_date.strftime('%d.%m.%Y')})"
             elif domain_days_left <= 30:
-                domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                domain_status = f"⚠️ истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
             else:
-                domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                domain_status = f"установлен вручную - до {domain_date.strftime('%d.%m.%Y')}"
             response_text += f"**Домен:** {domain_status}\n"
         else:
             response_text += "**Домен:** Дата не установлена\n"
@@ -1554,16 +1659,24 @@ async def handle_group_mention(message: Message):
                 # Добавляем информацию о резервном домене без проверки доступности
                 site_info = f"**URL:** {display_url}\n**Статус:** 🔄 резервный домен (проверка доступности пропущена)"
                 
+                # Добавляем информацию о WHOIS
+                site_info += f"\n**🔍 WHOIS:** "
+                if domain_expires_at:
+                    domain_date = datetime.fromisoformat(domain_expires_at).date()
+                    site_info += f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+                else:
+                    site_info += "дата не установлена"
+                
                 # Добавляем информацию о сроках окончания домена
                 if domain_expires_at:
                     domain_date = datetime.fromisoformat(domain_expires_at).date()
                     domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
                     if domain_days_left <= 0:
-                        domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                        domain_status = f"⚠️ **истёк!** ({domain_date.strftime('%d.%m.%Y')})"
                     elif domain_days_left <= 30:
-                        domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                        domain_status = f"⚠️ истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
                     else:
-                        domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                        domain_status = f"установлен вручную - до {domain_date.strftime('%d.%m.%Y')}"
                     site_info += f"\n**Домен:** {domain_status}"
                 else:
                     site_info += "\n**Домен:** Дата не установлена"
@@ -1607,16 +1720,24 @@ async def handle_group_mention(message: Message):
                 else:
                     site_info += "\n**SSL:** ❌ не найден или недействителен"
             
+            # Добавляем информацию о WHOIS для всех сайтов
+            site_info += f"\n**🔍 WHOIS:** "
+            if domain_expires_at:
+                domain_date = datetime.fromisoformat(domain_expires_at).date()
+                site_info += f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+            else:
+                site_info += "дата не установлена"
+            
             # Добавляем информацию о сроках окончания домена для всех сайтов
             if domain_expires_at:
                 domain_date = datetime.fromisoformat(domain_expires_at).date()
                 domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
                 if domain_days_left <= 0:
-                    domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                    domain_status = f"⚠️ **истёк!** ({domain_date.strftime('%d.%m.%Y')})"
                 elif domain_days_left <= 30:
-                    domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                    domain_status = f"⚠️ истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
                 else:
-                    domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                    domain_status = f"установлен вручную - до {domain_date.strftime('%d.%m.%Y')}"
                 site_info += f"\n**Домен:** {domain_status}"
             else:
                 site_info += "\n**Домен:** Дата не установлена"
@@ -1921,12 +2042,16 @@ async def check_site_availability(url):
                 check_type: "http", "tcp_only", "down"
     """
     start_time = time.time()
+    session = None
     
     # Шаг 1: HTTP-проверка через curl_cffi
     try:
         if CURL_CFFI_AVAILABLE:
             # Используем curl_cffi с имперсонацией Chrome 120
-            async with curl_requests.AsyncSession(impersonate="chrome120") as session:
+            # Создаем сессию отдельно для лучшего контроля над ресурсами
+            session = curl_requests.AsyncSession(impersonate="chrome120")
+            
+            try:
                 response = await session.get(url, timeout=30)
                 response_time = time.time() - start_time
                 
@@ -1964,13 +2089,39 @@ async def check_site_availability(url):
                 else:
                     logging.warning(f"Сайт {url} вернул ошибку HTTP {response.status_code}")
                     return False, response.status_code, response_time, page_title, final_url, "http"
+                    
+            finally:
+                # Явно закрываем сессию, чтобы избежать предупреждений
+                if session:
+                    try:
+                        await session.close()
+                    except Exception as close_error:
+                        logging.debug(f"Ошибка при закрытии сессии curl_cffi: {close_error}")
         else:
             # Fallback к aiohttp если curl_cffi недоступен
             return await check_site_fallback_aiohttp(url, start_time)
             
     except Exception as e:
         total_time = time.time() - start_time
-        logging.warning(f"HTTP-проверка не удалась для {url}: {e} (время: {total_time:.2f}s)")
+        error_msg = str(e)
+        
+        # Проверяем на критические ошибки curl_cffi, которые могут повлиять на мониторинг
+        if "Curlm" in error_msg or "curl" in error_msg.lower() or "libcurl" in error_msg.lower():
+            logging.error(f"Критическая ошибка curl_cffi для {url}: {e} (время: {total_time:.2f}s)")
+            # Отправляем уведомление администратору о проблеме с curl_cffi
+            try:
+                await send_admin_notification(f"⚠️ Критическая ошибка curl_cffi при проверке {url}: {e}\nВремя: {total_time:.2f}s")
+            except Exception as notify_error:
+                logging.error(f"Не удалось отправить уведомление об ошибке curl_cffi: {notify_error}")
+        else:
+            logging.warning(f"HTTP-проверка не удалась для {url}: {e} (время: {total_time:.2f}s)")
+        
+        # Убедимся, что сессия закрыта при ошибке
+        if session:
+            try:
+                await session.close()
+            except Exception as close_error:
+                logging.debug(f"Ошибка при закрытии сессии curl_cffi после исключения: {close_error}")
         
         # При любой ошибке пробуем TCP-проверку
         tcp_result = await tcp_check(url)
@@ -2099,7 +2250,18 @@ async def check_site_fallback_aiohttp(url, start_time):
                 
     except Exception as e:
         total_time = time.time() - start_time
-        logging.warning(f"aiohttp fallback не удался для {url}: {e} (время: {total_time:.2f}s)")
+        error_msg = str(e)
+        
+        # Проверяем на критические ошибки aiohttp, которые могут повлиять на мониторинг
+        if "ClientError" in error_msg or "ServerDisconnectedError" in error_msg or "ConnectorError" in error_msg:
+            logging.error(f"Критическая ошибка aiohttp для {url}: {e} (время: {total_time:.2f}s)")
+            # Отправляем уведомление администратору о проблеме с aiohttp
+            try:
+                await send_admin_notification(f"⚠️ Критическая ошибка aiohttp при проверке {url}: {e}\nВремя: {total_time:.2f}s")
+            except Exception as notify_error:
+                logging.error(f"Не удалось отправить уведомление об ошибке aiohttp: {notify_error}")
+        else:
+            logging.warning(f"aiohttp fallback не удался для {url}: {e} (время: {total_time:.2f}s)")
         
         # При любой ошибке пробуем TCP-проверку
         tcp_result = await tcp_check(url)
@@ -2349,16 +2511,24 @@ async def handle_show_reserve_domains_callback(callback: CallbackQuery):
             display_url = site['original_url'] if site['original_url'] else site['url']
             site_info = f"**URL:** {display_url}\n**Статус:** 🔄 резервный домен (проверка пропущена)"
             
+            # Добавляем информацию о WHOIS
+            site_info += f"\n**🔍 WHOIS:** "
+            if site.get('domain_expires_at'):
+                domain_date = datetime.fromisoformat(site['domain_expires_at']).date()
+                site_info += f"Домен до {domain_date.strftime('%d.%m.%Y')}"
+            else:
+                site_info += "дата не установлена"
+            
             # Добавляем информацию о сроках окончания домена
             if site.get('domain_expires_at'):
                 domain_date = datetime.fromisoformat(site['domain_expires_at']).date()
                 domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
                 if domain_days_left <= 0:
-                    domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                    domain_status = f"⚠️ **истёк!** ({domain_date.strftime('%d.%m.%Y')})"
                 elif domain_days_left <= 30:
-                    domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                    domain_status = f"⚠️ истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
                 else:
-                    domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                    domain_status = f"установлен вручную - до {domain_date.strftime('%d.%m.%Y')}"
                 site_info += f"\n**Домен:** {domain_status}"
             else:
                 site_info += "\n**Домен:** Дата не установлена"
