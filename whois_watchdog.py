@@ -23,6 +23,43 @@ RENEWAL_THRESHOLD_DAYS = 30  # Порог для обнаружения прод
 EXPIRATION_REMINDERS = [30, 7, 3, 1]  # Дни для напоминаний об истечении
 
 
+def extract_domain_from_url(url: str) -> str:
+    """
+    Извлекает доменное имя из URL.
+    
+    Args:
+        url: URL-адрес (может содержать протокол, путь и т.д.)
+        
+    Returns:
+        str: Доменное имя в punycode (если содержит кириллицу)
+    """
+    try:
+        # Удаляем протокол, если он есть
+        if '://' in url:
+            url = url.split('://', 1)[1]
+        
+        # Удаляем путь, если он есть
+        if '/' in url:
+            url = url.split('/', 1)[0]
+        
+        # Удаляем порт, если он есть
+        if ':' in url:
+            url = url.split(':', 1)[0]
+        
+        # Преобразуем в punycode, если есть кириллица
+        try:
+            url.encode('ascii')
+            # Если нет ошибки, это уже ASCII/Punycode
+            return url.lower()
+        except UnicodeEncodeError:
+            # Преобразуем в punycode
+            return url.encode('idna').decode('ascii').lower()
+            
+    except Exception as e:
+        logging.error(f"Ошибка при извлечении домена из URL {url}: {e}")
+        return url.lower()
+
+
 async def get_whois_expiry_date(domain: str) -> Optional[datetime]:
     """
     Robust WHOIS lookup with mandatory Punycode conversion for IDN domains.

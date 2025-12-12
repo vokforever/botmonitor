@@ -6,12 +6,20 @@ services:
     container_name: botmonitor
     restart: unless-stopped
     environment:
-      - BOT_TOKEN=${BOT_TOKEN}
-      - CHAT_ID=${CHAT_ID}
-      # Добавьте другие переменные которые использует ваш бот
+      - API_TOKEN=${API_TOKEN}
+      - ADMIN_CHAT_ID=${ADMIN_CHAT_ID}
+      - SUPABASE_URL=${SUPABASE_URL}
+      - SUPABASE_KEY=${SUPABASE_KEY}
+      - ONLY_ADMIN_PUSH=${ONLY_ADMIN_PUSH:-False}
+      - DOWN_CHECK_ATTEMPTS=${DOWN_CHECK_ATTEMPTS:-3}
+      - DOWN_CHECK_INTERVAL=${DOWN_CHECK_INTERVAL:-10}
+      - DNS_ERROR_MULTIPLIER=${DNS_ERROR_MULTIPLIER:-2}
+      - ENABLE_ALTERNATIVE_CHECK=${ENABLE_ALTERNATIVE_CHECK:-True}
     volumes:
       # Если нужно сохранять данные/логи
       - ./data:/app/data
+      # Для кэша резервных доменов
+      - ./reserve_domains_cache.json:/app/reserve_domains_cache.json
     # ports: (для telegram бота порты не нужны)
     #   - "3000:3000"
     logging:
