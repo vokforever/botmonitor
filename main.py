@@ -15,7 +15,6 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
-from aiogram.client.session.aiohttp import AiohttpSession
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 from supabase import create_client, Client
@@ -45,16 +44,21 @@ SUPABASE_KEY = os.getenv('SUPABASE_KEY')
 if not SUPABASE_URL or not SUPABASE_KEY:
     raise ValueError("SUPABASE_URL и SUPABASE_KEY не найдены в переменных окружения")
 
-# ScreenshotMachine API ключ (опционально)
-SCREENSHOTMACHINE_API_KEY = os.getenv('SCREENSHOTMACHINE_API_KEY')
+# ScreenshotMachine API ключ (опционально) - функционал удален
+# SCREENSHOTMACHINE_API_KEY = os.getenv('SCREENSHOTMACHINE_API_KEY')
 
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
-from io import BytesIO
+# from io import BytesIO  # Удален функционал скриншотов
 
-# Создаем устойчивую сессию с настройками таймаута
-session = AiohttpSession(timeout=ClientTimeout(total=60, connect=15))
-bot = Bot(token=API_TOKEN, session=session)
+# Глобальный словарь для кэширования резервных доменов
+RESERVE_DOMAINS_CACHE = {}
+CACHE_FILE_PATH = "reserve_domains_cache.json"
+CACHE_UPDATE_INTERVAL = 86400  # 24 часа в секундах
+LAST_CACHE_UPDATE = 0
+
+# Создаем бота без кастомной сессии (используем стандартные настройки таймаута)
+bot = Bot(token=API_TOKEN)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -293,142 +297,172 @@ async def check_ssl_certificate(url):
             else:
                 domain = remaining
 
-            # Создаем контекст SSL
-            context = ssl.create_default_context()
+        logging.debug(f"Начинаю проверку SSL сертификата для домена: {domain}")
+        
+        # Создаем контекст SSL
+        context = ssl.create_default_context()
 
-            # Устанавливаем соединение
-            with socket.create_connection((domain, 443)) as sock:
-                with context.wrap_socket(sock, server_hostname=domain) as ssock:
-                    cert = ssock.getpeercert(binary_form=True)
-                    x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_ASN1, cert)
+        # Устанавливаем соединение с таймаутом
+        with socket.create_connection((domain, 443), timeout=10) as sock:
+            with context.wrap_socket(sock, server_hostname=domain) as ssock:
+                cert = ssock.getpeercert(binary_form=True)
+                x509 = OpenSSL.crypto.load_certificate(OpenSSL.crypto.FILETYPE_ASN1, cert)
 
-                    # Получаем срок действия сертификата
-                    expiry_date = datetime.strptime(x509.get_notAfter().decode('ascii'), '%Y%m%d%H%M%SZ')
-                    # FIX: Make expiry_date timezone-aware (UTC)
-                    expiry_date = expiry_date.replace(tzinfo=timezone.utc)
-                    issuer = dict(x509.get_issuer().get_components())
-                    issuer_name = issuer.get(b'CN', b'Unknown').decode('utf-8')
-                    subject = dict(x509.get_subject().get_components())
-                    subject_name = subject.get(b'CN', b'Unknown').decode('utf-8')
+                # Получаем срок действия сертификата
+                expiry_date = datetime.strptime(x509.get_notAfter().decode('ascii'), '%Y%m%d%H%M%SZ')
+                # FIX: Make expiry_date timezone-aware (UTC)
+                expiry_date = expiry_date.replace(tzinfo=timezone.utc)
+                issuer = dict(x509.get_issuer().get_components())
+                issuer_name = issuer.get(b'CN', b'Unknown').decode('utf-8')
+                subject = dict(x509.get_subject().get_components())
+                subject_name = subject.get(b'CN', b'Unknown').decode('utf-8')
 
-                    days_left = (expiry_date - datetime.now(timezone.utc)).days
+                days_left = (expiry_date - datetime.now(timezone.utc)).days
+                
+                logging.debug(f"SSL сертификат для {domain}: издатель={issuer_name}, субъект={subject_name}, дней до истечения={days_left}")
 
-                    return {
-                        'has_ssl': True,
-                        'expiry_date': expiry_date,
-                        'days_left': days_left,
-                        'issuer': issuer_name,
-                        'subject': subject_name,
-                        'expires_soon': days_left <= SSL_WARNING_DAYS,
-                        'expired': days_left <= 0
-                    }
+                return {
+                    'has_ssl': True,
+                    'expiry_date': expiry_date,
+                    'days_left': days_left,
+                    'issuer': issuer_name,
+                    'subject': subject_name,
+                    'expires_soon': days_left <= SSL_WARNING_DAYS,
+                    'expired': days_left <= 0
+                }
+    except socket.timeout as e:
+        logging.warning(f"Таймаут при проверке SSL сертификата для {url}: {e}")
+        return {
+            'has_ssl': False,
+            'error': f"SSL timeout: {str(e)}"
+        }
+    except socket.gaierror as e:
+        logging.warning(f"DNS ошибка при проверке SSL сертификата для {url}: {e}")
+        return {
+            'has_ssl': False,
+            'error': f"SSL DNS error: {str(e)}"
+        }
     except Exception as e:
-        logging.error(f"Error checking SSL certificate: {e}")
+        logging.error(f"Ошибка при проверке SSL сертификата для {url}: {e}")
         return {
             'has_ssl': False,
             'error': str(e)
         }
 
 
-async def take_screenshot(url: str) -> BytesIO:
-    """Создание скриншота через ScreenshotMachine API"""
-    if not SCREENSHOTMACHINE_API_KEY:
-        logging.error("ScreenshotMachine API key not provided")
-        return None
-    
-    try:
-        logging.info(f"Creating screenshot via ScreenshotMachine API for URL: {url}")
-        
-        # Параметры для ScreenshotMachine API
-        params = {
-            'key': SCREENSHOTMACHINE_API_KEY,
-            'url': url,
-            'dimension': '1920x1080',  # Высокое разрешение
-            'format': 'PNG',
-            'cacheLimit': 0,  # Не кэшировать
-            'timeout': 30,    # 30 секунд таймаут
-            'device': 'desktop',
-            'fullPage': 'false',
-            'thumbnail': 'false'
-        }
-        
-        # Настраиваем таймаут для aiohttp
-        timeout = aiohttp.ClientTimeout(total=35)
-        
-        # Отправляем запрос к API с использованием aiohttp
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get('https://api.screenshotmachine.com', params=params) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    logging.info(f"Screenshot created successfully via API for {url}")
-                    return BytesIO(content)
-                else:
-                    error_text = await response.text()
-                    logging.error(f"ScreenshotMachine API error: {response.status} - {error_text}")
-                    return None
-            
-    except asyncio.TimeoutError:
-        logging.error(f"Timeout while creating screenshot via API for {url}")
-        return None
-    except aiohttp.ClientError as e:
-        logging.error(f"Request error while creating screenshot via API for {url}: {e}")
-        return None
-    except Exception as e:
-        logging.error(f"Unexpected error while creating screenshot via API for {url}: {e}")
-        return None
-
-
-async def diagnose_api():
-    """Диагностическая функция для проверки работы ScreenshotMachine API"""
-    try:
-        logging.info("Starting ScreenshotMachine API diagnosis...")
-        
-        if not SCREENSHOTMACHINE_API_KEY:
-            logging.error("ScreenshotMachine API key not provided")
-            return False
-        
-        # Тестируем API с простым запросом
-        test_url = "https://httpbin.org/get"
-        params = {
-            'key': SCREENSHOTMACHINE_API_KEY,
-            'url': test_url,
-            'dimension': '1024x768',
-            'format': 'PNG',
-            'cacheLimit': 0,
-            'timeout': 10
-        }
-        
-        # Настраиваем таймаут для aiohttp
-        timeout = aiohttp.ClientTimeout(total=15)
-        
-        # Отправляем запрос с использованием aiohttp
-        async with aiohttp.ClientSession(timeout=timeout) as session:
-            async with session.get('https://api.screenshotmachine.com', params=params) as response:
-                if response.status == 200:
-                    content = await response.read()
-                    logging.info("ScreenshotMachine API is working correctly")
-                    logging.info(f"API response size: {len(content)} bytes")
-                    return True
-                else:
-                    error_text = await response.text()
-                    logging.error(f"ScreenshotMachine API error: {response.status} - {error_text}")
-                    return False
-            
-    except asyncio.TimeoutError:
-        logging.error("Timeout during ScreenshotMachine API diagnosis")
-        return False
-    except aiohttp.ClientError as e:
-        logging.error(f"Request error during ScreenshotMachine API diagnosis: {e}")
-        return False
-    except Exception as e:
-        logging.error(f"ScreenshotMachine API diagnosis failed: {e}")
-        return False
+# Функционал создания скриншотов через ScreenshotMachine API удален для стабильности работы бота
 
 
 # Настройка базы данных
 def init_db():
     # Таблица создается через SQL в Supabase Dashboard
     pass
+
+# Функции для работы с кэшем резервных доменов
+async def load_reserve_domains_cache():
+    """Загружает кэш резервных доменов из файла или обновляет из БД"""
+    global RESERVE_DOMAINS_CACHE, LAST_CACHE_UPDATE
+    
+    try:
+        # Проверяем наличие файла и его актуальность
+        if os.path.exists(CACHE_FILE_PATH):
+            file_mtime = os.path.getmtime(CACHE_FILE_PATH)
+            current_time = datetime.now(timezone.utc).timestamp()
+            
+            # Если файл актуальный (младше 24 часов), загружаем из него
+            if current_time - file_mtime < CACHE_UPDATE_INTERVAL:
+                logging.info(f"Загружаем кэш резервных доменов из файла {CACHE_FILE_PATH}")
+                with open(CACHE_FILE_PATH, 'r', encoding='utf-8') as f:
+                    import json
+                    cache_data = json.load(f)
+                    RESERVE_DOMAINS_CACHE = {int(k): v for k, v in cache_data.items()}
+                    LAST_CACHE_UPDATE = file_mtime
+                    logging.info(f"Загружено {len(RESERVE_DOMAINS_CACHE)} резервных доменов из кэша")
+                    return
+    except Exception as e:
+        logging.error(f"Ошибка при загрузке кэша резервных доменов: {e}")
+    
+    # Если файла нет или он устарел, обновляем из БД
+    logging.info("Обновляем кэш резервных доменов из базы данных")
+    await update_reserve_domains_cache()
+
+async def update_reserve_domains_cache():
+    """Обновляет кэш резервных доменов из базы данных"""
+    global RESERVE_DOMAINS_CACHE, LAST_CACHE_UPDATE
+    
+    try:
+        # Получаем все сайты с флагом is_reserve_domain = true
+        success, sites_result = await safe_supabase_operation(
+            lambda: supabase.table('botmonitor_sites').select('id, url, is_reserve_domain').eq('is_reserve_domain', True).execute(),
+            operation_name="get_reserve_domains_for_cache"
+        )
+        
+        if not success:
+            logging.error(f"Не удалось получить резервные домены для кэша: {sites_result}")
+            return
+        
+        # Обновляем кэш в памяти
+        RESERVE_DOMAINS_CACHE = {}
+        for site in sites_result.data:
+            site_id = site['id']
+            RESERVE_DOMAINS_CACHE[site_id] = {
+                'url': site['url'],
+                'is_reserve_domain': site['is_reserve_domain']
+            }
+        
+        # Сохраняем кэш в файл
+        try:
+            import json
+            with open(CACHE_FILE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(RESERVE_DOMAINS_CACHE, f, ensure_ascii=False, indent=2)
+            LAST_CACHE_UPDATE = datetime.now(timezone.utc).timestamp()
+            logging.info(f"Кэш резервных доменов обновлен: {len(RESERVE_DOMAINS_CACHE)} доменов")
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении кэша резервных доменов: {e}")
+            
+    except Exception as e:
+        logging.error(f"Ошибка при обновлении кэша резервных доменов: {e}")
+
+def is_reserve_domain_cached(site_id: int) -> bool:
+    """Проверяет, является ли домен резервным, используя кэш"""
+    if site_id in RESERVE_DOMAINS_CACHE:
+        return RESERVE_DOMAINS_CACHE[site_id].get('is_reserve_domain', False)
+    return False
+
+async def update_site_reserve_status(site_id: int, is_reserve: bool):
+    """Обновляет статус резервного домена в БД и в кэше"""
+    # Обновляем в БД
+    success, result = await safe_supabase_operation(
+        lambda: supabase.table('botmonitor_sites').update({'is_reserve_domain': is_reserve}).eq('id', site_id).execute(),
+        operation_name=f"update_reserve_status_{site_id}"
+    )
+    
+    if success:
+        # Обновляем в кэше
+        if site_id in RESERVE_DOMAINS_CACHE:
+            RESERVE_DOMAINS_CACHE[site_id]['is_reserve_domain'] = is_reserve
+        elif is_reserve:
+            # Если сайт стал резервным, добавляем его в кэш
+            site_data = supabase.table('botmonitor_sites').select('id, url').eq('id', site_id).execute()
+            if site_data.data:
+                RESERVE_DOMAINS_CACHE[site_id] = {
+                    'url': site_data.data[0]['url'],
+                    'is_reserve_domain': True
+                }
+        
+        # Если сайт перестал быть резервным, удаляем его из кэша
+        if not is_reserve and site_id in RESERVE_DOMAINS_CACHE:
+            del RESERVE_DOMAINS_CACHE[site_id]
+            
+        # Сохраняем изменения в файл
+        try:
+            import json
+            with open(CACHE_FILE_PATH, 'w', encoding='utf-8') as f:
+                json.dump(RESERVE_DOMAINS_CACHE, f, ensure_ascii=False, indent=2)
+        except Exception as e:
+            logging.error(f"Ошибка при сохранении кэша после обновления статуса: {e}")
+    
+    return success
 
 
 # Состояния для добавления сайта
@@ -451,12 +485,11 @@ async def cmd_start(message: Message):
         "/list - показать список отслеживаемых сайтов\n"
         "/remove - удалить сайт из мониторинга\n"
         "/status - проверить статус всех сайтов\n"
+        "/reserve ID - переключить сайт в режим резервного домена\n"
         "/setdomain ID - установить дату истечения домена\n"
         "/sethosting ID - установить дату истечения хостинга\n"
         "/myid - показать ваш User ID и Chat ID\n"
         "/help - показать справку\n"
-        "/screenshot ID/URL - сделать скриншот сайта\n"
-        "/diagnose - диагностика ScreenshotMachine API"
     )
 
 
@@ -480,11 +513,10 @@ async def cmd_help(message: Message):
     help_text += "/list - показать список всех отслеживаемых сайтов\n"
     help_text += "/remove [ID] - удалить сайт из мониторинга\n"
     help_text += "/status - выполнить проверку статуса всех сайтов\n"
+    help_text += "/reserve [ID] - переключить сайт в режим резервного домена\n"
     help_text += "/setdomain [ID] - установить дату истечения домена\n"
     help_text += "/sethosting [ID] - установить дату истечения хостинга\n"
     help_text += "/myid - показать ваш User ID и Chat ID\n"
-    help_text += "/screenshot [ID/URL] - сделать скриншот сайта\n"
-    help_text += "/diagnose - диагностика ScreenshotMachine API\n"
     help_text += "/help - показать эту справку\n\n"
     
     help_text += "**Что проверяет бот:**\n"
@@ -496,6 +528,12 @@ async def cmd_help(message: Message):
     help_text += "🔄 **Переадресация** - отслеживание конечного URL (до 7 редиректов)\n"
     help_text += "📆 **Срок домена и хостинга** - напоминания о продлении\n"
     help_text += "📊 **Uptime** - статистика доступности сайта\n\n"
+    
+    help_text += "**Резервные домены:**\n"
+    help_text += "🔄 Команда /reserve ID - переключает сайт в режим резервного домена\n"
+    help_text += "• Для резервных доменов отключена проверка доступности\n"
+    help_text += "• Отслеживаются только даты истечения домена и хостинга\n"
+    help_text += "• Уведомления о продлении отправляются как обычно\n\n"
     
     help_text += "**Технические детали:**\n"
     help_text += "• Автоматические проверки каждые **5-10 минут** (рандомизировано)\n"
@@ -551,37 +589,66 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
         await message.answer(f"✅ Сайт {original_url} уже отслеживается в этом чате.")
         return
 
-    # --- Общая часть для проверки статуса ---
-    status_msg_text = f"🔄 Проверяю доступность сайта {original_url}..."
+    # Проверяем, является ли сайт резервным доменом
+    is_reserve_domain = False
     if existing_site:
-        status_msg_text = f"🔄 Сайт {original_url} уже есть в базе. Перемещаю его в этот чат и проверяю статус..."
+        # Если сайт уже существует, получаем его текущий статус
+        site_data = supabase.table('botmonitor_sites').select('is_reserve_domain').eq('id', existing_site['id']).execute()
+        is_reserve_domain = site_data.data[0].get('is_reserve_domain', False) if site_data.data else False
     
-    status_msg = await message.answer(status_msg_text)
-    
-    # Получаем расширенные данные о проверке
-    status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
-    is_up = 1 if status else 0
-    
-    has_ssl = 0
-    ssl_expires_at = None
-    ssl_message = ""
-    if status and url.startswith('https://'):
-        await bot.edit_message_text(f"🔄 Проверяю SSL сертификат для {original_url}...",
-                                    chat_id=message.chat.id,
-                                    message_id=status_msg.message_id)
-        ssl_info = await check_ssl_certificate(url)
-        has_ssl = 1 if ssl_info.get('has_ssl', False) else 0
-        if has_ssl:
-            ssl_expires_at = ssl_info.get('expiry_date')
-            days_left = ssl_info.get('days_left')
-            if ssl_info.get('expired'):
-                ssl_message = f"\n⚠️ SSL сертификат ИСТЁК!"
-            elif ssl_info.get('expires_soon'):
-                ssl_message = f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+    # --- Общая часть для проверки статуса ---
+    if is_reserve_domain:
+        # Для резервных доменов не выполняем проверку доступности
+        status_msg_text = f"🔄 Добавляю резервный домен {original_url}..."
+        if existing_site:
+            status_msg_text = f"🔄 Перемещаю резервный домен {original_url} в этот чат..."
+        
+        status_msg = await message.answer(status_msg_text)
+        
+        # Устанавливаем значения по умолчанию для резервных доменов
+        status = True  # Считаем доступным, чтобы не отправлять уведомления
+        status_code = 200
+        attempts = 1
+        response_time = 0.0
+        page_title = "Резервный домен"
+        final_url = url
+        is_up = 1
+        
+        has_ssl = 0
+        ssl_expires_at = None
+        ssl_message = "\n🔄 SSL сертификат не проверяется для резервных доменов"
+    else:
+        # Для обычных доменов выполняем полную проверку
+        status_msg_text = f"🔄 Проверяю доступность сайта {original_url}..."
+        if existing_site:
+            status_msg_text = f"🔄 Сайт {original_url} уже есть в базе. Перемещаю его в этот чат и проверяю статус..."
+        
+        status_msg = await message.answer(status_msg_text)
+        
+        # Получаем расширенные данные о проверке
+        status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
+        is_up = 1 if status else 0
+        
+        has_ssl = 0
+        ssl_expires_at = None
+        ssl_message = ""
+        if status and url.startswith('https://'):
+            await bot.edit_message_text(f"🔄 Проверяю SSL сертификат для {original_url}...",
+                                        chat_id=message.chat.id,
+                                        message_id=status_msg.message_id)
+            ssl_info = await check_ssl_certificate(url)
+            has_ssl = 1 if ssl_info.get('has_ssl', False) else 0
+            if has_ssl:
+                ssl_expires_at = ssl_info.get('expiry_date')
+                days_left = ssl_info.get('days_left')
+                if ssl_info.get('expired'):
+                    ssl_message = f"\n⚠️ SSL сертификат ИСТЁК!"
+                elif ssl_info.get('expires_soon'):
+                    ssl_message = f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+                else:
+                    ssl_message = f"\nSSL сертификат действителен ещё {days_left} дней."
             else:
-                ssl_message = f"\nSSL сертификат действителен ещё {days_left} дней."
-        else:
-            ssl_message = "\n❌ SSL сертификат не найден или недействителен."
+                ssl_message = "\n❌ SSL сертификат не найден или недействителен."
     # --- Конец общей части ---
 
     punycode_info = ""
@@ -610,11 +677,17 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
         'successful_checks': 1 if status else 0
     }
 
+    # Добавляем информацию о том, является ли домен резервным
+    payload['is_reserve_domain'] = is_reserve_domain
+    
     if existing_site:
         # 2. САЙТ НАЙДЕН -> ВЫПОЛНЯЕМ UPDATE
         supabase.table('botmonitor_sites').update(payload).eq('id', existing_site['id']).execute()
         
-        final_message = f"✅ Сайт {original_url} был **перемещен** в этот чат.\nТекущий статус: {'доступен' if status else 'недоступен'} (код {status_code}).{response_info}{punycode_info}{ssl_message}"
+        if is_reserve_domain:
+            final_message = f"✅ Резервный домен {original_url} был **перемещен** в этот чат.\nПроверка доступности отключена.{punycode_info}{ssl_message}"
+        else:
+            final_message = f"✅ Сайт {original_url} был **перемещен** в этот чат.\nТекущий статус: {'доступен' if status else 'недоступен'} (код {status_code}).{response_info}{punycode_info}{ssl_message}"
         await bot.edit_message_text(final_message, chat_id=message.chat.id, message_id=status_msg.message_id)
 
     else:
@@ -624,7 +697,10 @@ async def process_and_add_site(original_url: str, message: Message, state: FSMCo
         
         supabase.table('botmonitor_sites').insert(payload).execute()
         
-        final_message = f"✅ Сайт {original_url} **добавлен** в мониторинг.\nСтатус: {'доступен' if status else 'недоступен'} (код {status_code}).{response_info}{punycode_info}{ssl_message}"
+        if is_reserve_domain:
+            final_message = f"✅ Резервный домен {original_url} **добавлен** в мониторинг.\nПроверка доступности отключена.{punycode_info}{ssl_message}"
+        else:
+            final_message = f"✅ Сайт {original_url} **добавлен** в мониторинг.\nСтатус: {'доступен' if status else 'недоступен'} (код {status_code}).{response_info}{punycode_info}{ssl_message}"
         await bot.edit_message_text(final_message, chat_id=message.chat.id, message_id=status_msg.message_id)
 
 
@@ -655,11 +731,20 @@ async def cmd_reserve(message: Message):
     current_status = site.get('is_reserve_domain', False)
     new_status = not current_status
     
-    # Обновляем статус
-    supabase.table('botmonitor_sites').update({'is_reserve_domain': new_status}).eq('id', site_id).execute()
+    # Обновляем статус с использованием новой функции
+    success = await update_site_reserve_status(site_id, new_status)
     
-    status_text = "резервным" if new_status else "обычным"
-    await message.answer(f"✅ Сайт {site['original_url']} теперь является {status_text} доменом")
+    if success:
+        if new_status:
+            status_text = "резервным"
+            additional_info = "\n🔄 Проверка доступности для этого домена отключена. Будут отслеживаться только даты истечения домена и хостинга."
+        else:
+            status_text = "обычным"
+            additional_info = "\n✅ Проверка доступности для этого домена включена."
+        
+        await message.answer(f"✅ Сайт {site['original_url']} теперь является {status_text} доменом.{additional_info}")
+    else:
+        await message.answer("❌ Не удалось обновить статус домена. Попробуйте позже.")
 
 
 # Обработчик команды /list
@@ -697,7 +782,7 @@ async def cmd_list(message: Message):
         is_reserve = site.get('is_reserve_domain', False)
         
         if is_reserve:
-            status = "🔄 резервный" if is_up else "⏸️ резервный (недоступен)"
+            status = "🔄 резервный (проверка доступности пропущена)"
         else:
             status = "✅ доступен" if is_up else "❌ недоступен"
             
@@ -816,138 +901,72 @@ async def cmd_status(message: Message):
     results = []
     for site_id, url, original_url in sites:
         display_url = original_url if original_url else url
-
-        # Проверяем доступность сайта с несколькими попытками - получаем расширенные данные
-        status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
-        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
-        site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
         
-        # Добавляем время ответа
-        if status and response_time > 0:
-            site_info += f"\n⏱️ Время ответа: {response_time:.2f}с"
+        # Получаем информацию о сайте, включая флаг резервного домена
+        site_data = supabase.table('botmonitor_sites').select('is_reserve_domain').eq('id', site_id).execute()
+        is_reserve_domain = site_data.data[0].get('is_reserve_domain', False) if site_data.data else False
+        
+        if is_reserve_domain:
+            # Для резервных доменов не проверяем доступность
+            site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: 🔄 резервный домен (проверка доступности пропущена)"
+            results.append(site_info)
+            
+            # Обновляем только время последней проверки для резервных доменов
+            supabase.table('botmonitor_sites').update({
+                'last_check': datetime.now(timezone.utc).isoformat()
+            }).eq('id', site_id).execute()
+        else:
+            # Для обычных доменов выполняем полную проверку
+            # Проверяем доступность сайта с несколькими попытками - получаем расширенные данные
+            status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
+            status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
+            site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
+            
+            # Добавляем время ответа
+            if status and response_time > 0:
+                site_info += f"\n⏱️ Время ответа: {response_time:.2f}с"
 
-        # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
-        ssl_info = None
-        has_ssl = False
-        ssl_expires_at = None
+            # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
+            ssl_info = None
+            has_ssl = False
+            ssl_expires_at = None
 
-        if status and url.startswith('https://'):
-            ssl_info = await check_ssl_certificate(url)
-            has_ssl = ssl_info.get('has_ssl', False)
+            if status and url.startswith('https://'):
+                ssl_info = await check_ssl_certificate(url)
+                has_ssl = ssl_info.get('has_ssl', False)
 
-            if has_ssl:
-                expiry_date = ssl_info.get('expiry_date')
-                days_left = ssl_info.get('days_left')
+                if has_ssl:
+                    expiry_date = ssl_info.get('expiry_date')
+                    days_left = ssl_info.get('days_left')
 
-                if ssl_info.get('expired'):
-                    site_info += f"\n⚠️ SSL сертификат ИСТЁК!"
-                elif ssl_info.get('expires_soon'):
-                    site_info += f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+                    if ssl_info.get('expired'):
+                        site_info += f"\n⚠️ SSL сертификат ИСТЁК!"
+                    elif ssl_info.get('expires_soon'):
+                        site_info += f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+                    else:
+                        site_info += f"\nSSL действителен ещё {days_left} дней"
+
+                    ssl_expires_at = expiry_date
                 else:
-                    site_info += f"\nSSL действителен ещё {days_left} дней"
+                    site_info += "\n❌ SSL сертификат не найден или недействителен"
 
-                ssl_expires_at = expiry_date
-            else:
-                site_info += "\n❌ SSL сертификат не найден или недействителен"
+            results.append(site_info)
 
-        results.append(site_info)
-
-        # Обновляем статус в БД с расширенными данными
-        supabase.table('botmonitor_sites').update({
-            'is_up': status,
-            'status_code': status_code,
-            'response_time': response_time if response_time > 0 else None,
-            'page_title': page_title,
-            'final_url': final_url,
-            'has_ssl': has_ssl,
-            'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
-            'last_check': datetime.now(timezone.utc).isoformat()
-        }).eq('id', site_id).execute()
+            # Обновляем статус в БД с расширенными данными
+            supabase.table('botmonitor_sites').update({
+                'is_up': status,
+                'status_code': status_code,
+                'response_time': response_time if response_time > 0 else None,
+                'page_title': page_title,
+                'final_url': final_url,
+                'has_ssl': has_ssl,
+                'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
+                'last_check': datetime.now(timezone.utc).isoformat()
+            }).eq('id', site_id).execute()
 
     response = "📊 Результаты проверки:\n\n" + "\n\n".join(results)
     await bot.edit_message_text(response, chat_id=message.chat.id, message_id=msg.message_id)
 
-
-@dp.message(Command("screenshot"))
-async def cmd_screenshot(message: Message):
-    command_parts = message.text.split(maxsplit=1)
-    if len(command_parts) < 2:
-        await message.answer("Укажите ID сайта или URL: /screenshot ID или /screenshot URL")
-        return
-    
-    argument = command_parts[1].strip()
-    
-    # Проверяем, является ли аргумент числом (ID)
-    try:
-        site_id = int(argument)
-        # Это ID - ищем сайт в базе данных
-        site_data = supabase.table('botmonitor_sites').select('url, original_url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
-        site = (site_data.data[0]['url'], site_data.data[0]['original_url']) if site_data.data else None
-        
-        if not site:
-            await message.answer(f"Сайт с ID {site_id} не найден в этом чате.")
-            return
-            
-        url, original_url = site
-        display_url = original_url if original_url else url
-        filename_suffix = f"id_{site_id}"
-        
-    except ValueError:
-        # Это не число - считаем это URL
-        url = process_url(argument)
-        display_url = argument  # Показываем оригинальный URL пользователю
-        filename_suffix = "url_" + argument.replace("://", "_").replace("/", "_").replace(".", "_")
-    
-    msg = await message.answer(f"Создаю скриншот для {display_url}...")
-    
-    screenshot = await take_screenshot(url)
-    
-    if screenshot:
-        await bot.send_photo(
-            chat_id=message.chat.id,
-            photo=types.BufferedInputFile(screenshot.getvalue(), filename=f"screenshot_{filename_suffix}.png"),
-            caption=f"Скриншот сайта: {display_url}"
-        )
-        await bot.delete_message(message.chat.id, msg.message_id)
-    else:
-        await bot.edit_message_text("Ошибка создания скриншота. Проверьте API ключ ScreenshotMachine.", 
-                                  chat_id=message.chat.id, message_id=msg.message_id)
-
-
-@dp.message(Command("diagnose"))
-async def cmd_diagnose(message: Message):
-    """Команда диагностики ScreenshotMachine API"""
-    # Проверка прав для групп
-    if message.chat.type in ['group', 'supergroup']:
-        if not await is_admin_in_chat(message.chat.id, message.from_user.id):
-            await message.answer("Только администраторы могут запускать диагностику в группе.")
-            return
-    
-    msg = await message.answer("🔍 Запускаю диагностику ScreenshotMachine API...")
-    
-    try:
-        result = await diagnose_api()
-        
-        if result:
-            await bot.edit_message_text(
-                "✅ Диагностика ScreenshotMachine API завершена успешно!\n"
-                "API работает корректно.",
-                chat_id=message.chat.id,
-                message_id=msg.message_id
-            )
-        else:
-            await bot.edit_message_text(
-                "❌ Диагностика ScreenshotMachine API завершилась с ошибками!\n"
-                "Проверьте API ключ и логи для подробной информации.",
-                chat_id=message.chat.id,
-                message_id=msg.message_id
-            )
-    except Exception as e:
-        await bot.edit_message_text(
-            f"❌ Ошибка при выполнении диагностики: {str(e)}",
-            chat_id=message.chat.id,
-            message_id=msg.message_id
-        )
 
 
 # Обработчик команды /setdomain
@@ -1087,52 +1106,6 @@ async def process_hosting_date_input(message: Message, state: FSMContext):
 
 
 # Вспомогательные функции для обработки команд в группах
-async def handle_screenshot_command(message: Message, args: str):
-    """Обработка команды /screenshot в группе"""
-    if not args:
-        await safe_reply_message(message, "Укажите ID сайта или URL: @бот /screenshot ID или @бот /screenshot URL")
-        return
-    
-    argument = args.strip()
-    
-    # Проверяем, является ли аргумент числом (ID)
-    try:
-        site_id = int(argument)
-        # Это ID - ищем сайт в базе данных
-        site_data = supabase.table('botmonitor_sites').select('url, original_url').eq('id', site_id).eq('chat_id', message.chat.id).execute()
-        site = (site_data.data[0]['url'], site_data.data[0]['original_url']) if site_data.data else None
-        
-        if not site:
-            await safe_reply_message(message, f"Сайт с ID {site_id} не найден в этом чате.")
-            return
-            
-        url, original_url = site
-        display_url = original_url if original_url else url
-        filename_suffix = f"id_{site_id}"
-        
-    except ValueError:
-        # Это не число - считаем это URL
-        url = process_url(argument)
-        display_url = argument  # Показываем оригинальный URL пользователю
-        filename_suffix = "url_" + argument.replace("://", "_").replace("/", "_").replace(".", "_")
-    
-    msg = await safe_reply_message(message, f"Создаю скриншот для {display_url}...")
-    
-    screenshot = await take_screenshot(url)
-    
-    if screenshot:
-        await bot.send_photo(
-            chat_id=message.chat.id,
-            photo=types.BufferedInputFile(screenshot.getvalue(), filename=f"screenshot_{filename_suffix}.png"),
-            caption=f"Скриншот сайта: {display_url}"
-        )
-        if msg:
-            await bot.delete_message(message.chat.id, msg.message_id)
-    else:
-        if msg:
-            await bot.edit_message_text("Ошибка создания скриншота. Проверьте API ключ ScreenshotMachine.", 
-                                      chat_id=message.chat.id, message_id=msg.message_id)
-
 async def handle_status_command(message: Message):
     """Обработка команды /status в группе"""
     logging.info(f"handle_status_command для чата {message.chat.id}, тип: {type(message.chat.id)}")
@@ -1155,45 +1128,60 @@ async def handle_status_command(message: Message):
     results = []
     for site_id, url, original_url in sites:
         display_url = original_url if original_url else url
+        
+        # Получаем информацию о сайте, включая флаг резервного домена
+        site_data = supabase.table('botmonitor_sites').select('is_reserve_domain').eq('id', site_id).execute()
+        is_reserve_domain = site_data.data[0].get('is_reserve_domain', False) if site_data.data else False
+        
+        if is_reserve_domain:
+            # Для резервных доменов не проверяем доступность
+            site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: 🔄 резервный домен (проверка доступности пропущена)"
+            results.append(site_info)
+            
+            # Обновляем только время последней проверки для резервных доменов
+            supabase.table('botmonitor_sites').update({
+                'last_check': datetime.now(timezone.utc).isoformat()
+            }).eq('id', site_id).execute()
+        else:
+            # Для обычных доменов выполняем полную проверку
+            # Проверяем доступность сайта
+            status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
+            status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
+            site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
 
-        # Проверяем доступность сайта
-        status, status_code, attempts = await check_site_with_retries(url)
-        status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
-        site_info = f"ID: {site_id}\nURL: {display_url}\nСтатус: {status_str}"
+            # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
+            ssl_info = None
+            has_ssl = False
+            ssl_expires_at = None
 
-        # Проверяем SSL сертификат, если сайт доступен и использует HTTPS
-        ssl_info = None
-        has_ssl = False
-        ssl_expires_at = None
+            if status and url.startswith('https://'):
+                ssl_info = await check_ssl_certificate(url)
+                has_ssl = ssl_info.get('has_ssl', False)
 
-        if status and url.startswith('https://'):
-            ssl_info = await check_ssl_certificate(url)
-            has_ssl = ssl_info.get('has_ssl', False)
+                if has_ssl:
+                    expiry_date = ssl_info.get('expiry_date')
+                    days_left = ssl_info.get('days_left')
 
-            if has_ssl:
-                expiry_date = ssl_info.get('expiry_date')
-                days_left = ssl_info.get('days_left')
+                    if ssl_info.get('expired'):
+                        site_info += f"\n⚠️ SSL сертификат ИСТЁК!"
+                    elif ssl_info.get('expires_soon'):
+                        site_info += f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+                    else:
+                        site_info += f"\nSSL действителен ещё {days_left} дней"
 
-                if ssl_info.get('expired'):
-                    site_info += f"\n⚠️ SSL сертификат ИСТЁК!"
-                elif ssl_info.get('expires_soon'):
-                    site_info += f"\n⚠️ SSL сертификат истекает через {days_left} дней!"
+                    ssl_expires_at = expiry_date
                 else:
-                    site_info += f"\nSSL действителен ещё {days_left} дней"
+                    site_info += "\n❌ SSL сертификат не найден или недействителен"
 
-                ssl_expires_at = expiry_date
-            else:
-                site_info += "\n❌ SSL сертификат не найден или недействителен"
+            results.append(site_info)
 
-        results.append(site_info)
-
-        # Обновляем статус в БД
-        supabase.table('botmonitor_sites').update({
-            'is_up': status,
-            'has_ssl': has_ssl,
-            'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
-            'last_check': datetime.now(timezone.utc).isoformat()
-        }).eq('id', site_id).execute()
+            # Обновляем статус в БД
+            supabase.table('botmonitor_sites').update({
+                'is_up': status,
+                'has_ssl': has_ssl,
+                'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at else None,
+                'last_check': datetime.now(timezone.utc).isoformat()
+            }).eq('id', site_id).execute()
 
     response = "📊 Результаты проверки:\n\n" + "\n\n".join(results)
     if msg:
@@ -1233,7 +1221,7 @@ async def handle_list_command(message: Message):
         is_reserve = site.get('is_reserve_domain', False)
         
         if is_reserve:
-            status = "🔄 резервный" if is_up else "⏸️ резервный (недоступен)"
+            status = "🔄 резервный (проверка доступности пропущена)"
         else:
             status = "✅ доступен" if is_up else "❌ недоступен"
             
@@ -1442,11 +1430,43 @@ async def handle_group_mention(message: Message):
         for site_id, url, original_url, is_reserve_domain, domain_expires_at, hosting_expires_at in sites:
             display_url = original_url if original_url else url
             
-            # Для резервных доменов не проверяем доступность и не показываем их
+            # Для резервных доменов не проверяем доступность, но показываем информацию о домене/хостинге
             if is_reserve_domain:
+                # Добавляем информацию о резервном домене без проверки доступности
+                site_info = f"**URL:** {display_url}\n**Статус:** 🔄 резервный домен (проверка доступности пропущена)"
+                
+                # Добавляем информацию о сроках окончания домена
+                if domain_expires_at:
+                    domain_date = datetime.fromisoformat(domain_expires_at).date()
+                    domain_days_left = (domain_date - datetime.now(timezone.utc).date()).days
+                    if domain_days_left <= 0:
+                        domain_status = f"⚠️ **Домен истёк!** ({domain_date.strftime('%d.%m.%Y')})"
+                    elif domain_days_left <= 30:
+                        domain_status = f"⚠️ Домен истекает через {domain_days_left} дней ({domain_date.strftime('%d.%m.%Y')})"
+                    else:
+                        domain_status = f"✅ Домен до {domain_date.strftime('%d.%m.%Y')}"
+                    site_info += f"\n**Домен:** {domain_status}"
+                else:
+                    site_info += "\n**Домен:** Дата не установлена"
+                
+                # Добавляем информацию о сроках окончания хостинга
+                if hosting_expires_at:
+                    hosting_date = datetime.fromisoformat(hosting_expires_at).date()
+                    hosting_days_left = (hosting_date - datetime.now(timezone.utc).date()).days
+                    if hosting_days_left <= 0:
+                        hosting_status = f"⚠️ **Хостинг истёк!** ({hosting_date.strftime('%d.%m.%Y')})"
+                    elif hosting_days_left <= 30:
+                        hosting_status = f"⚠️ Хостинг истекает через {hosting_days_left} дней ({hosting_date.strftime('%d.%m.%Y')})"
+                    else:
+                        hosting_status = f"✅ Хостинг до {hosting_date.strftime('%d.%m.%Y')}"
+                    site_info += f"\n**Хостинг:** {hosting_status}"
+                else:
+                    site_info += "\n**Хостинг:** Дата не установлена"
+                
+                results.append(site_info)
                 continue
             
-            status, status_code, attempts = await check_site_with_retries(url)
+            status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
             status_str = f"✅ доступен (код {status_code})" if status else f"❌ недоступен (код {status_code}, попыток: {attempts})"
             site_info = f"**URL:** {display_url}\n**Статус:** {status_str}"
 
@@ -1548,16 +1568,18 @@ async def check_site(url):
         tuple: (is_available, status_code, response_time, page_title, final_url)
     """
     import time
+    start_time = time.time()
+    
     try:
         # Настраиваем ClientSession с custom User-Agent и поддержкой редиректов
         headers = {
             'User-Agent': 'vokforever_site_monitor_bot'
         }
         
-        # Начинаем замер времени
-        start_time = time.time()
+        logging.debug(f"Начинаю запрос к {url}")
         
-        timeout = aiohttp.ClientTimeout(total=10)
+        # Устанавливаем жесткий таймаут в 30 секунд для всех сетевых операций
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
         async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
             # allow_redirects=True по умолчанию, max_redirects=10 по умолчанию
             # Устанавливаем max_redirects=7 как у конкурента
@@ -1568,34 +1590,43 @@ async def check_site(url):
                 # Получаем финальный URL после редиректов
                 final_url = str(response.url)
                 
-                # Получаем заголовок страницы
+                logging.debug(f"Ответ от {url}: статус={response.status}, время={response_time:.2f}с, финальный_url={final_url}")
+                
+                # Получаем заголовок страницы с таймаутом
                 page_title = None
                 if response.status < 400:
                     try:
-                        html_content = await response.text()
+                        # Устанавливаем таймаут на чтение контента
+                        html_content = await asyncio.wait_for(response.text(), timeout=10)
                         # Простой парсинг заголовка из HTML
                         import re
                         title_match = re.search(r'<title[^>]*>([^<]+)</title>', html_content, re.IGNORECASE)
                         if title_match:
                             page_title = title_match.group(1).strip()
+                        logging.debug(f"Заголовок страницы {url}: {page_title}")
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Таймаут при получении контента для {url}")
                     except Exception as title_error:
                         logging.debug(f"Не удалось извлечь заголовок для {url}: {title_error}")
                 
                 is_available = response.status < 400
                 return is_available, response.status, response_time, page_title, final_url
-                
+               
     except asyncio.TimeoutError:
-        logging.warning(f"Таймаут при проверке {url}")
-        return False, 0, 10.0, None, url
+        total_time = time.time() - start_time
+        logging.warning(f"Таймаут при проверке {url} (общее время: {total_time:.2f}с)")
+        return False, 0, 30.0, None, url
     except aiohttp.ClientError as e:
+        total_time = time.time() - start_time
         error_msg = str(e)
         if "No address associated with hostname" in error_msg or "Temporary failure in name resolution" in error_msg:
-            logging.warning(f"DNS ошибка при проверке {url}: {error_msg}")
+            logging.warning(f"DNS ошибка при проверке {url}: {error_msg} (время: {total_time:.2f}с)")
         else:
-            logging.warning(f"Ошибка подключения к {url}: {error_msg}")
+            logging.warning(f"Ошибка подключения к {url}: {error_msg} (время: {total_time:.2f}с)")
         return False, 0, 0.0, None, url
     except Exception as e:
-        logging.error(f"Неожиданная ошибка при проверке {url}: {e}")
+        total_time = time.time() - start_time
+        logging.error(f"Неожиданная ошибка при проверке {url}: {e} (время: {total_time:.2f}с)")
         return False, 0, 0.0, None, url
 
 async def check_site_alternative(url):
@@ -1608,6 +1639,8 @@ async def check_site_alternative(url):
         parsed = urlparse(url)
         domain = parsed.netloc
         
+        logging.debug(f"Начинаю альтернативную проверку для домена: {domain}")
+        
         # Пробуем ping (только для подтверждения DNS-резолвинга)
         try:
             # Используем ping с таймаутом 5 секунд и 1 пакетом
@@ -1619,6 +1652,8 @@ async def check_site_alternative(url):
                 ping_cmd = ['ping', '-n', '1', '-w', '5000', domain]
             else:
                 ping_cmd = ['ping', '-c', '1', '-W', '5', domain]
+            
+            logging.debug(f"Выполняю ping для домена {domain}")
             
             # Используем asyncio.create_subprocess_exec для неблокирующего выполнения
             proc = await asyncio.create_subprocess_exec(
@@ -1646,6 +1681,8 @@ async def check_site_alternative(url):
         try:
             # Для Windows используем nslookup, для Linux - dig или nslookup
             nslookup_cmd = ['nslookup', domain]
+            
+            logging.debug(f"Выполняю nslookup для домена {domain}")
             
             # Используем asyncio.create_subprocess_exec для неблокирующего выполнения
             proc = await asyncio.create_subprocess_exec(
@@ -1693,6 +1730,8 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
     last_response_time = 0.0
     last_page_title = None
     last_final_url = url
+    
+    logging.debug(f"Начинаю проверку сайта {url} (макс. попыток: {max_attempts}, интервал: {retry_interval} сек)")
     
     while attempts < max_attempts:
         attempts += 1
@@ -1742,7 +1781,7 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
             await asyncio.sleep(current_interval)
     
     # Если все попытки неудачны
-    logging.warning(f"Сайт {url} недоступен после {attempts} попыток (последний статус: {last_status_code}, DNS-ошибок: {dns_errors_count})")
+    logging.warning(f"Сайт {url} недоступен после {attempts} попыток (последний статус: {last_status_code}, DNS-ошибок: {dns_errors_count}, время ответа: {last_response_time:.2f}с)")
     return False, last_status_code, attempts, last_response_time, last_page_title, last_final_url
 
 
@@ -1871,7 +1910,8 @@ async def handle_renew_callback(callback: CallbackQuery):
 
         # Безопасное получение текущей даты из БД
         success, site_result = await safe_supabase_operation(
-            lambda: supabase.table('botmonitor_sites').select(date_field).eq('id', site_id).single().execute()
+            lambda: supabase.table('botmonitor_sites').select(date_field).eq('id', site_id).single().execute(),
+            operation_name=f"get_{renewal_type}_expiry_{site_id}"
         )
         
         if not success:
@@ -1889,7 +1929,8 @@ async def handle_renew_callback(callback: CallbackQuery):
 
         # Безопасное обновление в БД
         update_success, update_result = await safe_supabase_operation(
-            lambda: supabase.table('botmonitor_sites').update({date_field: new_date.isoformat()}).eq('id', site_id).execute()
+            lambda: supabase.table('botmonitor_sites').update({date_field: new_date.isoformat()}).eq('id', site_id).execute(),
+            operation_name=f"renew_{renewal_type}_{site_id}"
         )
         
         if not update_success:
@@ -1924,7 +1965,8 @@ async def handle_delete_callback(callback: CallbackQuery):
 
         # Безопасное получение информации о сайте
         success, site_result = await safe_supabase_operation(
-            lambda: supabase.table('botmonitor_sites').select('original_url, url').eq('id', site_id).execute()
+            lambda: supabase.table('botmonitor_sites').select('original_url, url').eq('id', site_id).execute(),
+            operation_name=f"get_site_for_delete_{site_id}"
         )
         
         if not success or not site_result.data:
@@ -1937,7 +1979,8 @@ async def handle_delete_callback(callback: CallbackQuery):
         
         # Безопасное удаление сайта из базы данных
         delete_success, delete_result = await safe_supabase_operation(
-            lambda: supabase.table('botmonitor_sites').delete().eq('id', site_id).execute()
+            lambda: supabase.table('botmonitor_sites').delete().eq('id', site_id).execute(),
+            operation_name=f"delete_site_{site_id}"
         )
         
         if not delete_success:
@@ -1962,7 +2005,8 @@ async def handle_show_reserve_domains_callback(callback: CallbackQuery):
         success, sites_result = await safe_supabase_operation(
             lambda: supabase.table('botmonitor_sites').select(
                 'id, url, original_url, domain_expires_at, hosting_expires_at'
-            ).eq('chat_id', callback.message.chat.id).eq('is_reserve_domain', True).execute()
+            ).eq('chat_id', callback.message.chat.id).eq('is_reserve_domain', True).execute(),
+            operation_name="get_reserve_domains"
         )
         
         if not success:
@@ -2027,7 +2071,7 @@ async def handle_show_reserve_domains_callback(callback: CallbackQuery):
 
 
 # Вспомогательная функция для безопасного выполнения операций с Supabase
-async def safe_supabase_operation(operation_func, max_retries=3, retry_delay=5):
+async def safe_supabase_operation(operation_func, max_retries=3, retry_delay=5, operation_name="unknown"):
     """
     Безопасное выполнение операции с Supabase с повторными попытками
     
@@ -2035,18 +2079,40 @@ async def safe_supabase_operation(operation_func, max_retries=3, retry_delay=5):
         operation_func: Функция, выполняющая операцию с Supabase
         max_retries: Максимальное количество попыток
         retry_delay: Задержка между попытками в секундах
+        operation_name: Название операции для логирования
     
     Returns:
         tuple: (success, result_or_error)
     """
+    start_time = datetime.now(timezone.utc)
+    
     for attempt in range(max_retries):
         try:
             # Выполняем операцию в отдельном потоке, чтобы не блокировать основной цикл
             result = await asyncio.to_thread(operation_func)
+            
+            # Логируем успешное выполнение
+            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+            logging.debug(f"Операция Supabase '{operation_name}' выполнена успешно за {duration:.3f} сек (попытка {attempt + 1})")
+            
             return True, result
         except Exception as e:
             error_msg = str(e)
-            logging.error(f"Ошибка Supabase (попытка {attempt + 1}/{max_retries}): {error_msg}")
+            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+            
+            # Определяем тип ошибки для лучшей диагностики
+            error_type = type(e).__name__
+            if "JSON could not be generated" in error_msg or "code 556" in error_msg:
+                error_type = "JSON_ERROR"
+                logging.error(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
+            elif "timeout" in error_msg.lower():
+                error_type = "TIMEOUT"
+                logging.warning(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
+            elif "connection" in error_msg.lower():
+                error_type = "CONNECTION"
+                logging.warning(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
+            else:
+                logging.error(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
             
             # Проверяем на специфические ошибки JSON
             if "JSON could not be generated" in error_msg or "code 556" in error_msg:
@@ -2060,25 +2126,30 @@ async def safe_supabase_operation(operation_func, max_retries=3, retry_delay=5):
             if attempt < max_retries - 1:
                 await asyncio.sleep(retry_delay)
             else:
+                total_duration = (datetime.now(timezone.utc) - start_time).total_seconds()
+                logging.error(f"Операция '{operation_name}' не выполнена после {max_retries} попыток за {total_duration:.2f} сек")
                 return False, e
     
     return False, Exception("Превышено максимальное количество попыток")
 
 # Функция проверки доступности сайтов (каждые 5 минут)
 async def scheduled_availability_check():
+    await bot.send_message(ADMIN_CHAT_ID, "🚀 Бот мониторинга запущен (режим отказоустойчивости)")
+    
     while True:
         try:
-            # Безопасное получение списка сайтов с повторными попытками
+            # 1. Получаем сайты из БД
             success, sites_result = await safe_supabase_operation(
                 lambda: supabase.table('botmonitor_sites').select(
                     'id, url, original_url, chat_id, is_up, has_ssl, ssl_expires_at, is_reserve_domain, status_code, response_time, avg_response_time, page_title, final_url, total_checks, successful_checks'
-                ).execute()
+                ).execute(),
+                operation_name="get_sites_for_check"
             )
             
             if not success:
                 logging.error(f"Не удалось получить список сайтов: {sites_result}")
-                await send_admin_notification(f"Критическая ошибка при получении списка сайтов: {sites_result}")
-                await asyncio.sleep(CHECK_INTERVAL)
+                await send_admin_notification(f"🔥 Критическая ошибка: не удалось получить список сайтов: {sites_result}")
+                await asyncio.sleep(60)  # Пауза перед перезапуском цикла
                 continue
             
             sites = sites_result.data
@@ -2087,142 +2158,205 @@ async def scheduled_availability_check():
                 await asyncio.sleep(CHECK_INTERVAL)
                 continue
 
-            logging.info(f"Начинаю проверку {len(sites)} сайтов")
+            start_time = datetime.now(timezone.utc)
+            logging.info(f"Начинаю проверку {len(sites)} сайтов (время: {start_time.strftime('%H:%M:%S')})")
             
-            for site in sites:
+            successful_checks = 0
+            failed_checks = 0
+            
+            # 2. Проверяем каждый сайт изолированно
+            for i, site in enumerate(sites, 1):
+                site_url = site.get('url', 'unknown')
                 try:
-                    chat_id = site['chat_id']
-                    display_url = site['original_url'] or site['url']
-                    site_id, url, original_url = site['id'], site['url'], site['original_url']
-                    
-                    # Получаем старые значения для отслеживания изменений
-                    was_up = site['is_up']
-                    had_ssl = site['has_ssl']
-                    old_ssl_expires_at = site['ssl_expires_at']
-                    old_status_code = site.get('status_code')
-                    old_page_title = site.get('page_title')
-                    old_final_url = site.get('final_url')
-                    old_avg_response_time = site.get('avg_response_time', 0.0) or 0.0
-                    total_checks = site.get('total_checks', 0) or 0
-                    successful_checks = site.get('successful_checks', 0) or 0
-                    
-                    now = datetime.now(timezone.utc)
-
-                    # 1. Проверяем доступность с несколькими попытками - получаем расширенные данные
-                    status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
-                    status_changed = status != bool(was_up)
-                    
-                    # Обновляем счетчики
-                    total_checks += 1
-                    if status:
-                        successful_checks += 1
-                    
-                    # Вычисляем среднее время ответа (скользящее среднее)
-                    if response_time > 0:
-                        if old_avg_response_time > 0:
-                            new_avg_response_time = (old_avg_response_time * 0.8) + (response_time * 0.2)
-                        else:
-                            new_avg_response_time = response_time
-                    else:
-                        new_avg_response_time = old_avg_response_time
-
-                    # 2. Проверяем SSL (только для обновления данных, без уведомлений)
-                    has_ssl, ssl_info, ssl_expires_at = False, None, old_ssl_expires_at
-                    if status and url.startswith('https://'):
-                        ssl_info = await check_ssl_certificate(url)
-                        has_ssl = ssl_info.get('has_ssl', False)
-                        if has_ssl:
-                            ssl_expires_at = ssl_info.get('expiry_date')
-
-                    # 3. Безопасное обновление статуса в БД с расширенными данными
-                    update_success, update_result = await safe_supabase_operation(
-                        lambda: supabase.table('botmonitor_sites').update({
-                            'is_up': status,
-                            'status_code': status_code,
-                            'response_time': response_time if response_time > 0 else None,
-                            'avg_response_time': new_avg_response_time if new_avg_response_time > 0 else None,
-                            'page_title': page_title,
-                            'final_url': final_url,
-                            'has_ssl': has_ssl,
-                            'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at and hasattr(ssl_expires_at, 'isoformat') else ssl_expires_at,
-                            'last_check': now.isoformat(),
-                            'last_status_change': now.isoformat() if status_changed else site.get('last_status_change'),
-                            'total_checks': total_checks,
-                            'successful_checks': successful_checks
-                        }).eq('id', site_id).execute()
-                    )
-                    
-                    if not update_success:
-                        logging.error(f"Не удалось обновить статус сайта {site_id}: {update_result}")
-                        await send_admin_notification(f"Ошибка обновления сайта {display_url}: {update_result}")
-                        continue
-
-                    # 4. Отправляем уведомления (только для нерезервных доменов)
-                    if not site.get('is_reserve_domain', False):
-                        notifications = []
-                        
-                        # Изменение доступности
-                        if status_changed:
-                            if status:
-                                msg = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}"
-                                if response_time > 0:
-                                    msg += f"\n⏱️ Время ответа: {response_time:.2f}с"
-                                notifications.append(msg)
-                            else:
-                                msg = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nПроверок выполнено: {attempts}/{DOWN_CHECK_ATTEMPTS}"
-                                notifications.append(msg)
-                        
-                        # Изменение кода ответа (без изменения доступности)
-                        elif status and old_status_code and status_code != old_status_code:
-                            msg = f"ℹ️ Изменился код ответа сайта\nURL: {display_url}\nБыло: {old_status_code} → Стало: {status_code}"
-                            notifications.append(msg)
-                        
-                        # Изменение заголовка страницы
-                        if status and page_title and old_page_title and page_title != old_page_title:
-                            msg = f"📝 Изменился заголовок страницы\nURL: {display_url}\nБыло: {old_page_title}\nСтало: {page_title}"
-                            notifications.append(msg)
-                        
-                        # Изменение конечного URL (редирект)
-                        if status and final_url and old_final_url and final_url != old_final_url:
-                            msg = f"🔄 Изменился конечный URL\nURL: {display_url}\nБыло: {old_final_url}\nСтало: {final_url}"
-                            notifications.append(msg)
-                        
-                        # Значительное увеличение времени ответа (в 2 раза)
-                        if status and response_time > 0 and old_avg_response_time > 0:
-                            if response_time > (old_avg_response_time * 2) and response_time > 3.0:  # Только если >3 сек
-                                msg = f"⚠️ Значительное увеличение времени ответа\nURL: {display_url}\nОбычно: {old_avg_response_time:.2f}с → Сейчас: {response_time:.2f}с"
-                                notifications.append(msg)
-                        
-                        # Отправляем все уведомления
-                        for notification in notifications:
-                            try:
-                                await send_notification(chat_id, notification)
-                                await asyncio.sleep(0.5)  # Небольшая задержка между уведомлениями
-                            except Exception as notify_error:
-                                logging.error(f"Ошибка отправки уведомления для сайта {site_id}: {notify_error}")
-                
-                except Exception as site_error:
-                    logging.error(f"Ошибка при обработке сайта {site.get('id', 'unknown')}: {site_error}")
-                    # Продолжаем обработку других сайтов даже если один вызвал ошибку
+                    logging.debug(f"[{i}/{len(sites)}] Проверка сайта: {site_url}")
+                    await check_single_site(site)
+                    successful_checks += 1
+                except Exception as site_e:
+                    failed_checks += 1
+                    logging.error(f"Ошибка при проверке сайта {site_url}: {site_e}")
+                    # Логика записи ошибки в БД для конкретного сайта, чтобы не терять данные
+                    # continue - идем к следующему сайту
                     continue
             
-            logging.info(f"Завершена проверка {len(sites)} сайтов")
+            end_time = datetime.now(timezone.utc)
+            duration = (end_time - start_time).total_seconds()
+            logging.info(f"Цикл проверки завершен за {duration:.2f} сек. Успешно: {successful_checks}, Ошибок: {failed_checks}")
                     
-        except Exception as e:
-            error_msg = str(e)
-            logging.error(f"Критическая ошибка в scheduled_availability_check: {error_msg}")
+        except Exception as global_e:
+            # 3. Глобальный перехват, чтобы бот не умер
+            error_msg = f"🔥 КРИТИЧЕСКАЯ ОШИБКА ЦИКЛА: {global_e}"
+            logging.critical(error_msg, exc_info=True)
+            try:
+                await bot.send_message(ADMIN_CHAT_ID, error_msg)
+            except:
+                pass # Если даже Telegram недоступен, просто пишем в лог
             
-            # Детальное логирование ошибки
-            import traceback
-            logging.error(f"Traceback: {traceback.format_exc()}")
-            
-            await send_admin_notification(f"Критическая ошибка в availability check: {error_msg}")
-        
+            await asyncio.sleep(60) # Даем время "остыть" перед перезапуском
+
         # Используем рандомизированный интервал 5-10 минут как у конкурента
         import random
         random_interval = random.randint(300, 600)  # 5-10 минут в секундах
         logging.info(f"Следующая проверка через {random_interval} секунд ({random_interval//60} мин {random_interval%60} сек)")
         await asyncio.sleep(random_interval)
+
+# Функция проверки отдельного сайта с изоляцией ошибок
+async def check_single_site(site):
+    """
+    Изолированная проверка отдельного сайта.
+    Ошибки при проверке одного сайта не должны влиять на другие сайты.
+    """
+    try:
+        site_id = site.get('id')
+        url = site.get('url')
+        original_url = site.get('original_url')
+        chat_id = site.get('chat_id')
+        display_url = original_url or url
+        
+        # Пропускаем проверку доступности для резервных доменов
+        if site.get('is_reserve_domain', False):
+            logging.debug(f"Пропускаем проверку доступности резервного домена {display_url} (ID: {site_id})")
+            # Обновляем только время последней проверки для резервных доменов
+            update_success, update_result = await safe_supabase_operation(
+                lambda: supabase.table('botmonitor_sites').update({
+                    'last_check': datetime.now(timezone.utc).isoformat()
+                }).eq('id', site_id).execute(),
+                operation_name=f"update_reserve_domain_check_time_{site_id}"
+            )
+            
+            if not update_success:
+                logging.error(f"Не удалось обновить время проверки для резервного домена {site_id}: {update_result}")
+            return
+        
+        logging.debug(f"Начинаю проверку сайта {display_url} (ID: {site_id})")
+        
+        # Получаем старые значения для отслеживания изменений
+        was_up = site['is_up']
+        had_ssl = site['has_ssl']
+        old_ssl_expires_at = site['ssl_expires_at']
+        old_status_code = site.get('status_code')
+        old_page_title = site.get('page_title')
+        old_final_url = site.get('final_url')
+        old_avg_response_time = site.get('avg_response_time', 0.0) or 0.0
+        total_checks = site.get('total_checks', 0) or 0
+        successful_checks = site.get('successful_checks', 0) or 0
+        
+        now = datetime.now(timezone.utc)
+
+        # 1. Проверяем доступность с несколькими попытками - получаем расширенные данные
+        status, status_code, attempts, response_time, page_title, final_url = await check_site_with_retries(url)
+        status_changed = status != bool(was_up)
+        
+        # Обновляем счетчики
+        total_checks += 1
+        if status:
+            successful_checks += 1
+        
+        # Вычисляем среднее время ответа (скользящее среднее)
+        if response_time > 0:
+            if old_avg_response_time > 0:
+                new_avg_response_time = (old_avg_response_time * 0.8) + (response_time * 0.2)
+            else:
+                new_avg_response_time = response_time
+        else:
+            new_avg_response_time = old_avg_response_time
+
+        # 2. Проверяем SSL (только для обновления данных, без уведомлений)
+        has_ssl, ssl_info, ssl_expires_at = False, None, old_ssl_expires_at
+        if status and url.startswith('https://'):
+            ssl_info = await check_ssl_certificate(url)
+            has_ssl = ssl_info.get('has_ssl', False)
+            if has_ssl:
+                ssl_expires_at = ssl_info.get('expiry_date')
+
+        # 3. Безопасное обновление статуса в БД с расширенными данными
+        update_success, update_result = await safe_supabase_operation(
+            lambda: supabase.table('botmonitor_sites').update({
+                'is_up': status,
+                'status_code': status_code,
+                'response_time': response_time if response_time > 0 else None,
+                'avg_response_time': new_avg_response_time if new_avg_response_time > 0 else None,
+                'page_title': page_title,
+                'final_url': final_url,
+                'has_ssl': has_ssl,
+                'ssl_expires_at': ssl_expires_at.isoformat() if ssl_expires_at and hasattr(ssl_expires_at, 'isoformat') else ssl_expires_at,
+                'last_check': now.isoformat(),
+                'last_status_change': now.isoformat() if status_changed else site.get('last_status_change'),
+                'total_checks': total_checks,
+                'successful_checks': successful_checks
+            }).eq('id', site_id).execute(),
+            operation_name=f"update_site_status_{site_id}"
+        )
+        
+        if not update_success:
+            logging.error(f"Не удалось обновить статус сайта {site_id}: {update_result}")
+            # Не отправляем уведомление админу об ошибке обновления одного сайта
+            return
+
+        # 4. Отправляем уведомления (только для нерезервных доменов)
+        if not site.get('is_reserve_domain', False):
+            notifications = []
+            
+            # Изменение доступности
+            if status_changed:
+                if status:
+                    msg = f"✅ Сайт снова доступен!\nURL: {display_url}\nКод ответа: {status_code}"
+                    if response_time > 0:
+                        msg += f"\n⏱️ Время ответа: {response_time:.2f}с"
+                    notifications.append(msg)
+                else:
+                    msg = f"❌ Сайт стал недоступен!\nURL: {display_url}\nКод ответа: {status_code}\nПроверок выполнено: {attempts}/{DOWN_CHECK_ATTEMPTS}"
+                    notifications.append(msg)
+            
+            # Изменение кода ответа (без изменения доступности)
+            elif status and old_status_code and status_code != old_status_code:
+                msg = f"ℹ️ Изменился код ответа сайта\nURL: {display_url}\nБыло: {old_status_code} → Стало: {status_code}"
+                notifications.append(msg)
+            
+            # Изменение заголовка страницы
+            if status and page_title and old_page_title and page_title != old_page_title:
+                msg = f"📝 Изменился заголовок страницы\nURL: {display_url}\nБыло: {old_page_title}\nСтало: {page_title}"
+                notifications.append(msg)
+            
+            # Изменение конечного URL (редирект)
+            if status and final_url and old_final_url and final_url != old_final_url:
+                msg = f"🔄 Изменился конечный URL\nURL: {display_url}\nБыло: {old_final_url}\nСтало: {final_url}"
+                notifications.append(msg)
+            
+            # Значительное увеличение времени ответа (в 2 раза)
+            if status and response_time > 0 and old_avg_response_time > 0:
+                if response_time > (old_avg_response_time * 2) and response_time > 3.0:  # Только если >3 сек
+                    msg = f"⚠️ Значительное увеличение времени ответа\nURL: {display_url}\nОбычно: {old_avg_response_time:.2f}с → Сейчас: {response_time:.2f}с"
+                    notifications.append(msg)
+            
+            # Отправляем все уведомления
+            for notification in notifications:
+                try:
+                    await send_notification(chat_id, notification)
+                    await asyncio.sleep(0.5)  # Небольшая задержка между уведомлениями
+                except Exception as notify_error:
+                    logging.error(f"Ошибка отправки уведомления для сайта {site_id}: {notify_error}")
+    
+    except Exception as e:
+        # Изолируем ошибку конкретного сайта, чтобы она не повлияла на другие
+        site_url = site.get('url', 'unknown')
+        site_id = site.get('id', 'unknown')
+        logging.error(f"Критическая ошибка при проверке сайта {site_url} (ID: {site_id}): {e}", exc_info=True)
+        # Помечаем сайт как недоступный в БД, если возможно
+        try:
+            site_id = site.get('id')
+            if site_id:
+                await safe_supabase_operation(
+                    lambda: supabase.table('botmonitor_sites').update({
+                        'is_up': False,
+                        'last_check': datetime.now(timezone.utc).isoformat()
+                    }).eq('id', site_id).execute(),
+                    operation_name=f"mark_site_down_{site_id}"
+                )
+        except Exception as update_error:
+            logging.error(f"Не удалось обновить статус недоступности для сайта {site.get('id', 'unknown')}: {update_error}")
+        
+        # Продолжаем работу, не прерывая цикл проверки других сайтов
+        return
 
 # Функция проверки уведомлений о сроках истечения (один раз в день)
 async def scheduled_notification_check():
@@ -2233,6 +2367,9 @@ async def scheduled_notification_check():
             if now.hour == 9 and now.minute < 5:  # Проверяем в течение 5 минут
                 logging.info("Начинаю проверку уведомлений о сроках истечения")
                 
+                # Обновляем кэш резервных доменов раз в сутки
+                await update_reserve_domains_cache()
+                
                 # Безопасное получение списка сайтов с повторными попытками
                 success, sites_result = await safe_supabase_operation(
                     lambda: supabase.table('botmonitor_sites').select(
@@ -2242,8 +2379,8 @@ async def scheduled_notification_check():
                 
                 if not success:
                     logging.error(f"Не удалось получить список сайтов для проверки уведомлений: {sites_result}")
-                    await send_admin_notification(f"Критическая ошибка при получении сайтов для уведомлений: {sites_result}")
-                    await asyncio.sleep(300)
+                    await send_admin_notification(f"🔥 Критическая ошибка: не удалось получить сайты для уведомлений: {sites_result}")
+                    await asyncio.sleep(60)  # Пауза перед перезапуском цикла
                     continue
                 
                 sites = sites_result.data
@@ -2252,116 +2389,148 @@ async def scheduled_notification_check():
                     await asyncio.sleep(300)
                     continue
 
-                logging.info(f"Проверяю уведомления для {len(sites)} сайтов")
+                start_time = datetime.now(timezone.utc)
+                logging.info(f"Проверяю уведомления для {len(sites)} сайтов (время: {start_time.strftime('%H:%M:%S')})")
                 
-                for site in sites:
+                successful_notifications = 0
+                failed_notifications = 0
+                
+                # Проверяем каждый сайт изолированно
+                for i, site in enumerate(sites, 1):
+                    site_url = site.get('url', 'unknown')
                     try:
-                        chat_id = site['chat_id']
-                        display_url = site['original_url'] or site['url']
-                        site_id = site['id']
-                        now_date = now.date()
-                        
-                        # Новая логика уведомлений - только в конкретные дни
-                        notification_days = {30, 14, 7, 6, 5, 4, 3, 2, 1}
-
-                        # Проверка SSL
-                        if site.get('has_ssl') and site.get('ssl_expires_at'):
-                            ssl_expiry_date = datetime.fromisoformat(site['ssl_expires_at']).date()
-                            days_left = (ssl_expiry_date - now_date).days
-                            
-                            if days_left in notification_days or days_left <= 0:
-                                last_ssl_notification = site.get('ssl_last_notification_day')
-                                if last_ssl_notification != now_date or last_ssl_notification is None:
-                                    if days_left <= 0:
-                                        message = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
-                                    else:
-                                        message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!"
-                                    
-                                    await send_admin_notification(f"🔔 Уведомление для чата ID: {chat_id}\n\n{message}")
-                                    
-                                    # Безопасное обновление даты последнего SSL уведомления
-                                    update_success, update_result = await safe_supabase_operation(
-                                        lambda: supabase.table('botmonitor_sites').update({
-                                            'ssl_last_notification_day': now_date.isoformat()
-                                        }).eq('id', site_id).execute()
-                                    )
-                                    
-                                    if not update_success:
-                                        logging.error(f"Не удалось обновить дату SSL уведомления для сайта {site_id}: {update_result}")
-
-                        # Проверка домена
-                        if site.get('domain_expires_at'):
-                            domain_expiry_date = datetime.fromisoformat(site['domain_expires_at']).date()
-                            days_left = (domain_expiry_date - now_date).days
-                            
-                            if days_left in notification_days or days_left <= 0:
-                                last_domain_notification = site.get('domain_last_notification_day')
-                                if last_domain_notification != now_date or last_domain_notification is None:
-                                    message = f"‼️ **Домен:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({domain_expiry_date.strftime('%d.%m.%Y')})!"
-                                    keyboard = get_renewal_keyboard(site_id, "domain")
-                                    target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
-                                    
-                                    try:
-                                        await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
-                                    except Exception as send_error:
-                                        logging.error(f"Ошибка отправки уведомления о домене для сайта {site_id}: {send_error}")
-                                    
-                                    # Безопасное обновление даты последнего уведомления о домене
-                                    update_success, update_result = await safe_supabase_operation(
-                                        lambda: supabase.table('botmonitor_sites').update({
-                                            'domain_last_notification_day': now_date.isoformat()
-                                        }).eq('id', site_id).execute()
-                                    )
-                                    
-                                    if not update_success:
-                                        logging.error(f"Не удалось обновить дату уведомления о домене для сайта {site_id}: {update_result}")
-
-                        # Проверка хостинга
-                        if site.get('hosting_expires_at'):
-                            hosting_expiry_date = datetime.fromisoformat(site['hosting_expires_at']).date()
-                            days_left = (hosting_expiry_date - now_date).days
-                            
-                            if days_left in notification_days or days_left <= 0:
-                                last_hosting_notification = site.get('hosting_last_notification_day')
-                                if last_hosting_notification != now_date or last_hosting_notification is None:
-                                    message = f"🖥️ **Хостинг:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
-                                    keyboard = get_renewal_keyboard(site_id, "hosting")
-                                    target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
-                                    
-                                    try:
-                                        await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
-                                    except Exception as send_error:
-                                        logging.error(f"Ошибка отправки уведомления о хостинге для сайта {site_id}: {send_error}")
-                                    
-                                    # Безопасное обновление даты последнего уведомления о хостинге
-                                    update_success, update_result = await safe_supabase_operation(
-                                        lambda: supabase.table('botmonitor_sites').update({
-                                            'hosting_last_notification_day': now_date.isoformat()
-                                        }).eq('id', site_id).execute()
-                                    )
-                                    
-                                    if not update_success:
-                                        logging.error(f"Не удалось обновить дату уведомления о хостинге для сайта {site_id}: {update_result}")
-                    
-                    except Exception as site_error:
-                        logging.error(f"Ошибка при обработке уведомлений для сайта {site.get('id', 'unknown')}: {site_error}")
-                        # Продолжаем обработку других сайтов даже если один вызвал ошибку
+                        logging.debug(f"[{i}/{len(sites)}] Проверка уведомлений для сайта: {site_url}")
+                        await check_site_notifications(site, now)
+                        successful_notifications += 1
+                    except Exception as site_e:
+                        failed_notifications += 1
+                        logging.error(f"Ошибка при проверке уведомлений для сайта {site_url}: {site_e}")
+                        # Продолжаем проверку других сайтов
                         continue
+                
+                end_time = datetime.now(timezone.utc)
+                duration = (end_time - start_time).total_seconds()
+                logging.info(f"Проверка уведомлений завершена за {duration:.2f} сек. Успешно: {successful_notifications}, Ошибок: {failed_notifications}")
                 
                 logging.info(f"Завершена проверка уведомлений для {len(sites)} сайтов")
 
-        except Exception as e:
-            error_msg = str(e)
-            logging.error(f"Критическая ошибка в scheduled_notification_check: {error_msg}")
+        except Exception as global_e:
+            # Глобальный перехват для уведомлений
+            error_msg = f"🔥 КРИТИЧЕСКАЯ ОШИБКА ЦИКЛА УВЕДОМЛЕНИЙ: {global_e}"
+            logging.critical(error_msg, exc_info=True)
+            try:
+                await bot.send_message(ADMIN_CHAT_ID, error_msg)
+            except:
+                pass  # Если даже Telegram недоступен, просто пишем в лог
             
-            # Детальное логирование ошибки
-            import traceback
-            logging.error(f"Traceback: {traceback.format_exc()}")
-            
-            await send_admin_notification(f"Критическая ошибка в notification check: {error_msg}")
+            await asyncio.sleep(60)  # Даем время "остыть" перед перезапуском
         
         # Проверяем уведомления каждые 5 минут, но отправляем только в 9:00
         await asyncio.sleep(300)  # 5 минут
+
+# Функция проверки уведомлений для отдельного сайта с изоляцией ошибок
+async def check_site_notifications(site, now):
+    """
+    Изолированная проверка уведомлений для отдельного сайта.
+    Проверяет уведомления о доменах и хостинге для ВСЕХ сайтов, включая резервные.
+    """
+    chat_id = site['chat_id']
+    display_url = site['original_url'] or site['url']
+    site_id = site['id']
+    is_reserve = site.get('is_reserve_domain', False)
+    now_date = now.date()
+    
+    # Новая логика уведомлений - только в конкретные дни
+    notification_days = {30, 14, 7, 6, 5, 4, 3, 2, 1}
+    
+    # Для резервных доменов проверяем только уведомления о домене и хостинге
+    # SSL уведомления для резервных доменов не отправляем
+
+    # Проверка SSL (только для нерезервных доменов)
+    if not is_reserve and site.get('has_ssl') and site.get('ssl_expires_at'):
+        ssl_expiry_date = datetime.fromisoformat(site['ssl_expires_at']).date()
+        days_left = (ssl_expiry_date - now_date).days
+        
+        if days_left in notification_days or days_left <= 0:
+            last_ssl_notification = site.get('ssl_last_notification_day')
+            if last_ssl_notification != now_date or last_ssl_notification is None:
+                if days_left <= 0:
+                    message = f"⚠️ SSL сертификат для {display_url} ИСТЁК!\nТребуется немедленное обновление."
+                else:
+                    message = f"⚠️ SSL сертификат для {display_url} истекает через {days_left} дней!"
+                
+                await send_admin_notification(f"🔔 Уведомление для чата ID: {chat_id}\n\n{message}")
+                
+                # Безопасное обновление даты последнего SSL уведомления
+                update_success, update_result = await safe_supabase_operation(
+                    lambda: supabase.table('botmonitor_sites').update({
+                        'ssl_last_notification_day': now_date.isoformat()
+                    }).eq('id', site_id).execute(),
+                    operation_name=f"update_ssl_notification_{site_id}"
+                )
+                
+                if not update_success:
+                    logging.error(f"Не удалось обновить дату SSL уведомления для сайта {site_id}: {update_result}")
+
+    # Проверка домена (для всех сайтов, включая резервные)
+    if site.get('domain_expires_at'):
+        domain_expiry_date = datetime.fromisoformat(site['domain_expires_at']).date()
+        days_left = (domain_expiry_date - now_date).days
+        
+        if days_left in notification_days or days_left <= 0:
+            last_domain_notification = site.get('domain_last_notification_day')
+            if last_domain_notification != now_date or last_domain_notification is None:
+                # Для резервных доменов добавляем специальное обозначение
+                domain_type = "резервного домена" if is_reserve else "домена"
+                message = f"‼️ **{domain_type.capitalize()}:** Срок оплаты для `{display_url}` истекает через **{days_left} дней** ({domain_expiry_date.strftime('%d.%m.%Y')})!"
+                keyboard = get_renewal_keyboard(site_id, "domain")
+                target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+                
+                try:
+                    await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
+                except Exception as send_error:
+                    logging.error(f"Ошибка отправки уведомления о домене для сайта {site_id}: {send_error}")
+                
+                # Безопасное обновление даты последнего уведомления о домене
+                update_success, update_result = await safe_supabase_operation(
+                    lambda: supabase.table('botmonitor_sites').update({
+                        'domain_last_notification_day': now_date.isoformat()
+                    }).eq('id', site_id).execute(),
+                    operation_name=f"update_domain_notification_{site_id}"
+                )
+                
+                if not update_success:
+                    logging.error(f"Не удалось обновить дату уведомления о домене для сайта {site_id}: {update_result}")
+
+    # Проверка хостинга (для всех сайтов, включая резервные)
+    if site.get('hosting_expires_at'):
+        hosting_expiry_date = datetime.fromisoformat(site['hosting_expires_at']).date()
+        days_left = (hosting_expiry_date - now_date).days
+        
+        if days_left in notification_days or days_left <= 0:
+            last_hosting_notification = site.get('hosting_last_notification_day')
+            if last_hosting_notification != now_date or last_hosting_notification is None:
+                # Для резервных доменов добавляем специальное обозначение
+                hosting_type = "резервного домена" if is_reserve else "сайта"
+                message = f"🖥️ **Хостинг:** Срок оплаты для `{display_url}` ({hosting_type}) истекает через **{days_left} дней** ({hosting_expiry_date.strftime('%d.%m.%Y')})!"
+                keyboard = get_renewal_keyboard(site_id, "hosting")
+                target_chat_id = ADMIN_CHAT_ID if ONLY_ADMIN_PUSH else chat_id
+                
+                try:
+                    await bot.send_message(target_chat_id, message, reply_markup=keyboard, parse_mode="Markdown")
+                except Exception as send_error:
+                    logging.error(f"Ошибка отправки уведомления о хостинге для сайта {site_id}: {send_error}")
+                
+                # Безопасное обновление даты последнего уведомления о хостинге
+                update_success, update_result = await safe_supabase_operation(
+                    lambda: supabase.table('botmonitor_sites').update({
+                        'hosting_last_notification_day': now_date.isoformat()
+                    }).eq('id', site_id).execute(),
+                    operation_name=f"update_hosting_notification_{site_id}"
+                )
+                
+                if not update_success:
+                    logging.error(f"Не удалось обновить дату уведомления о хостинге для сайта {site_id}: {update_result}")
 
 
 # Запуск периодических проверок как фоновые задачи
@@ -2372,44 +2541,60 @@ async def on_startup():
 
 async def supervisor():
     """
-    Supervisor паттерн для обработки сетевых ошибок и перезапуска бота
+    Улучшенный supervisor паттерн для обработки сетевых ошибок и перезапуска бота
     """
+    restart_count = 0
     while True:
         try:
-            logging.info("Запуск бота с supervisor паттерном...")
+            start_time = datetime.now(timezone.utc)
+            logging.info(f"Запуск бота с улучшенным supervisor паттерном... (перезапуск #{restart_count}, время: {start_time.strftime('%H:%M:%S')})")
             await dp.start_polling(bot)
         except (TelegramNetworkError, ConnectionError, TimeoutError) as e:
-            logging.error(f"Сетевая ошибка в боте: {e}")
-            await send_admin_notification(f"⚠️ Сетевая ошибка в боте, перезапуск через 5 секунд: {e}")
+            restart_count += 1
+            error_type = type(e).__name__
+            error_msg = f"⚠️ Сетевая ошибка в боте ({error_type}): {e}"
+            logging.error(error_msg)
+            try:
+                await send_admin_notification(f"{error_msg}, перезапуск через 5 секунд (перезапуск #{restart_count})")
+            except Exception as notify_error:
+                logging.error(f"Не удалось отправить уведомление о сетевой ошибке: {notify_error}")
+            logging.info(f"Пауза 5 секунд перед перезапуском...")
             await asyncio.sleep(5)
         except Exception as e:
-            logging.error(f"Критическая ошибка в боте: {e}")
+            restart_count += 1
+            error_type = type(e).__name__
+            error_msg = f"🚨 Критическая ошибка в боте ({error_type}): {e}"
+            logging.error(error_msg)
             import traceback
             logging.error(f"Traceback: {traceback.format_exc()}")
-            await send_admin_notification(f"🚨 Критическая ошибка в боте, перезапуск через 10 секунд: {e}")
+            try:
+                await send_admin_notification(f"{error_msg}, перезапуск через 10 секунд (перезапуск #{restart_count})")
+            except Exception as notify_error:
+                logging.error(f"Не удалось отправить уведомление о критической ошибке: {notify_error}")
+            logging.info(f"Пауза 10 секунд перед перезапуском...")
             await asyncio.sleep(10)
 
 
 async def main():
     init_db()
     
+    # Загружаем кэш резервных доменов
+    await load_reserve_domains_cache()
+    
     # Получаем количество сайтов в базе данных
     sites_count = get_sites_count()
-    
-    # Запускаем диагностику API при старте
-    logging.info("Running ScreenshotMachine API diagnosis on startup...")
-    api_ok = await diagnose_api()
     
     # Получаем локальное время (UTC+3 для Москвы)
     from datetime import timedelta
     moscow_time = datetime.now(timezone.utc) + timedelta(hours=3)
     
     # Отправляем уведомление админу о запуске
+    cache_info = f"🔄 Кэш резервных доменов: {len(RESERVE_DOMAINS_CACHE)} доменов"
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
                      f"⏰ Время запуска: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}\n" \
                      f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
                      f"📊 Сайтов в базе проверки: {sites_count}\n" \
-                     f"📸 ScreenshotMachine API: {'✅ OK' if api_ok else '❌ Ошибка'}"
+                     f"{cache_info}"
     await send_admin_notification(startup_message)
     
     # Также выводим в лог
@@ -2417,7 +2602,7 @@ async def main():
     logging.info(f"⏰ Время запуска: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}")
     logging.info(f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут")
     logging.info(f"📊 Сайтов в базе проверки: {sites_count}")
-    logging.info(f"📸 ScreenshotMachine API: {'✅ OK' if api_ok else '❌ Ошибка'}")
+    logging.info(f"🔄 Кэш резервных доменов загружен: {len(RESERVE_DOMAINS_CACHE)} доменов")
     
     # Запускаем задачу проверки сайтов при старте
     await on_startup()
