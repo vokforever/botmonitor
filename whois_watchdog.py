@@ -1,15 +1,21 @@
 import asyncio
 import logging
 import re
+import sys
 from datetime import datetime, timezone, timedelta
 from typing import Optional, Tuple, Dict, Any
 
+# Исправление для Windows Proactor event loop предупреждения
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 import asyncwhois
+import tldextract
 from aiogram import Bot, types
 from aiogram.types import InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from supabase import Client
 
-from main import safe_supabase_operation, send_admin_notification
+from utils import safe_supabase_operation, send_admin_notification
 
 # Константы для WHOIS Watchdog
 WHOIS_CHECK_HOUR = 10  # Время ежедневной проверки (10:00 UTC)
@@ -19,40 +25,76 @@ EXPIRATION_REMINDERS = [30, 7, 3, 1]  # Дни для напоминаний о�
 
 async def get_whois_expiry_date(domain: str) -> Optional[datetime]:
     """
-    Получает дату истечения домена из WHOIS с использованием asyncwhois
-    
-    Args:
-        domain: Имя домена для проверки
-        
-    Returns:
-        datetime с датой истечения или None в случае ошибки
+    Robust WHOIS lookup compatible with asyncwhois v1.1.12+
     """
     try:
         logging.info(f"Получение WHOIS данных для домена: {domain}")
         
-        # Используем asyncwhois для получения данных
-        result = await asyncwhois.aio_whois(domain)
+        # 1. Clean Domain Extraction (removes http://, www., etc.)
+        ext = tldextract.extract(domain)
+        clean_domain = f"{ext.domain}.{ext.suffix}"
         
-        if not result or not result.get('expiration_date'):
-            logging.warning(f"Не удалось получить дату истечения для домена {domain}")
+        if not ext.domain or not ext.suffix:
+             logging.warning(f"Некорректный домен: {domain}")
+             return None
+
+        # 2. Async Lookup (FIXED API CALL)
+        # Using the correct asyncwhois v1.1.12+ API
+        result = await asyncwhois.aio_whois(clean_domain)
+        
+        # 3. Normalized Result Parsing
+        whois_dict = {}
+        
+        # Case A: DomainLookup object with parser_output (Standard v1.1.12+)
+        if hasattr(result, 'parser_output'):
+            whois_dict = result.parser_output
+        # Case B: Dictionary (Direct return)
+        elif isinstance(result, dict):
+            whois_dict = result
+        # Case C: Tuple (Legacy/Specific calls)
+        elif isinstance(result, tuple):
+             # Try to find the dict in the tuple
+             for item in result:
+                 if isinstance(item, dict):
+                     whois_dict = item
+                     break
+
+        if not whois_dict:
+            logging.warning(f"Пустой результат WHOIS для {clean_domain}")
             return None
-            
-        # Преобразуем дату в datetime объект
-        expiry_date = result['expiration_date']
-        if isinstance(expiry_date, list) and expiry_date:
+
+        # 4. Date Extraction (Try multiple common keys)
+        expiry_keys = ['expires', 'expiration_date', 'registry_expiry_date', 'paid-till', 'free-date']
+        expiry_date = None
+        
+        for key in expiry_keys:
+            val = whois_dict.get(key)
+            if val:
+                expiry_date = val
+                break
+        
+        # 5. Date Normalization
+        if isinstance(expiry_date, list):
             expiry_date = expiry_date[0]
             
+        if isinstance(expiry_date, str):
+            # Try parsing common string formats if raw string returned
+            try:
+                # ISO format often works
+                expiry_date = datetime.fromisoformat(expiry_date)
+            except:
+                pass
+
         if isinstance(expiry_date, datetime):
-            # Убеждаемся, что дата имеет timezone
             if expiry_date.tzinfo is None:
                 expiry_date = expiry_date.replace(tzinfo=timezone.utc)
             return expiry_date
-        else:
-            logging.warning(f"Неожиданный формат даты для домена {domain}: {expiry_date}")
-            return None
             
+        logging.warning(f"Дата истечения не найдена или формат не распознан для {clean_domain}: {expiry_date}")
+        return None
+
     except Exception as e:
-        logging.error(f"Ошибка при получении WHOIS данных для домена {domain}: {e}")
+        logging.error(f"WHOIS Critical Error for {domain}: {e}")
         return None
 
 
@@ -264,7 +306,7 @@ async def handle_whois_confirm_callback(
         
         # Получаем данные домена
         success, domain_result = await safe_supabase_operation(
-            lambda: supabase.table('domain_monitor').select('*').eq('id', domain_id).single().execute(),
+            lambda: supabase.table('botmonitor_domain_monitor').select('*').eq('id', domain_id).single().execute(),
             operation_name=f"get_domain_for_confirm_{domain_id}"
         )
         
@@ -278,7 +320,7 @@ async def handle_whois_confirm_callback(
         
         # Обновляем дату в БД
         update_success, update_result = await safe_supabase_operation(
-            lambda: supabase.table('domain_monitor').update({
+            lambda: supabase.table('botmonitor_domain_monitor').update({
                 'current_expiry_date': new_expiry_date.isoformat(),
                 'updated_at': datetime.now(timezone.utc).isoformat()
             }).eq('id', domain_id).execute(),
@@ -339,7 +381,7 @@ async def handle_whois_reject_callback(
         
         # Получаем данные домена
         success, domain_result = await safe_supabase_operation(
-            lambda: supabase.table('domain_monitor').select('domain_name').eq('id', domain_id).single().execute(),
+            lambda: supabase.table('botmonitor_domain_monitor').select('domain_name').eq('id', domain_id).single().execute(),
             operation_name=f"get_domain_for_reject_{domain_id}"
         )
         
