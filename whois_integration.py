@@ -4,12 +4,17 @@
 
 import asyncio
 import logging
+import sys
 from datetime import datetime, timezone
 from aiogram import Bot, Dispatcher, F
 from aiogram.types import CallbackQuery, Message
 from aiogram.filters.command import Command
 from aiogram.fsm.context import FSMContext
 from aiogram.fsm.state import State, StatesGroup
+
+# Исправление для Windows Proactor event loop предупреждения
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
 
 from supabase import Client
 from whois_watchdog import (
@@ -19,7 +24,7 @@ from whois_watchdog import (
     handle_whois_reject_callback,
     get_whois_expiry_date
 )
-from main import safe_supabase_operation, send_admin_notification
+from utils import safe_supabase_operation, send_admin_notification
 
 
 # Состояния для добавления домена в мониторинг
@@ -366,8 +371,9 @@ def register_whois_handlers(dp: Dispatcher, supabase: Client, bot: Bot):
         
         for site in sites:
             url = site['original_url'] or site['url']
-            # Извлекаем домен из URL
-            domain = url.replace('https://', '').replace('http://', '').split('/')[0]
+            # Извлекаем домен из URL с использованием улучшенной функции
+            from main import extract_domain_from_url
+            domain = extract_domain_from_url(url)
             
             if not site.get('domain_expires_at'):
                 sites_without_domain_date.append({
@@ -413,13 +419,13 @@ def register_whois_handlers(dp: Dispatcher, supabase: Client, bot: Bot):
     # Обработчик команды /autowhois
     @dp.message(Command("autowhois"))
     async def cmd_autowhois(message: Message):
-        """Автоматически добавляет домены без даты истечения в WHOIS мониторинг"""
-        # Получаем сайты без даты истечения домена
+        """Запускает проверку WHOIS для всех доменов из botmonitor_sites"""
+        # Получаем все сайты из основной таблицы
         success, sites_result = await safe_supabase_operation(
             lambda: supabase.table('botmonitor_sites').select(
-                'id, url, original_url, chat_id'
-            ).is_('domain_expires_at', 'null').execute(),
-            operation_name="get_sites_without_domain_date"
+                'id, url, original_url, chat_id, domain_expires_at'
+            ).execute(),
+            operation_name="get_all_sites_for_whois"
         )
         
         if not success:
@@ -428,17 +434,20 @@ def register_whois_handlers(dp: Dispatcher, supabase: Client, bot: Bot):
         
         sites = sites_result.data
         if not sites:
-            await message.answer("✅ Все сайты имеют дату истечения домена")
+            await message.answer("📝 Список сайтов пуст")
             return
         
-        await message.answer(f"🔄 Проверяю {len(sites)} сайтов без даты истечения домена...")
+        await message.answer(f"🔄 Запускаю проверку WHOIS для {len(sites)} доменов...")
         
+        updated_count = 0
         added_count = 0
         failed_count = 0
         
         for site in sites:
             url = site['original_url'] or site['url']
-            domain = url.replace('https://', '').replace('http://', '').split('/')[0]
+            # Извлекаем домен из URL с использованием улучшенной функции
+            from main import extract_domain_from_url
+            domain = extract_domain_from_url(url)
             
             try:
                 # Получаем дату истечения через WHOIS
@@ -449,36 +458,93 @@ def register_whois_handlers(dp: Dispatcher, supabase: Client, bot: Bot):
                     failed_count += 1
                     continue
                 
-                # Добавляем в WHOIS мониторинг
-                success, result = await safe_supabase_operation(
-                    lambda: supabase.table('botmonitor_domain_monitor').insert({
-                        'domain_name': domain,
-                        'current_expiry_date': expiry_date.date().isoformat(),
-                        'admin_chat_id': site['chat_id'],  # Используем тот же чат
-                        'project_chat_id': site['chat_id'],  # Используем тот же чат
-                        'is_reserve_domain': False,  # По умолчанию не резервный
-                        'last_check_date': datetime.now(timezone.utc).isoformat()
-                    }).execute(),
-                    operation_name=f"auto_insert_domain_{domain}"
+                expiry_date_str = expiry_date.date().isoformat()
+                
+                # Проверяем, есть ли уже дата истечения в основной таблице
+                if site.get('domain_expires_at'):
+                    # Обновляем существующую дату в основной таблице
+                    update_success, update_result = await safe_supabase_operation(
+                        lambda: supabase.table('botmonitor_sites').update({
+                            'domain_expires_at': expiry_date_str
+                        }).eq('id', site['id']).execute(),
+                        operation_name=f"update_domain_expiry_{site['id']}"
+                    )
+                    
+                    if update_success:
+                        updated_count += 1
+                        logging.info(f"Обновлена дата домена {domain} в botmonitor_sites")
+                    else:
+                        failed_count += 1
+                        logging.error(f"Ошибка обновления даты домена {domain}: {update_result}")
+                else:
+                    # Добавляем дату в основную таблицу, если ее нет
+                    update_success, update_result = await safe_supabase_operation(
+                        lambda: supabase.table('botmonitor_sites').update({
+                            'domain_expires_at': expiry_date_str
+                        }).eq('id', site['id']).execute(),
+                        operation_name=f"add_domain_expiry_{site['id']}"
+                    )
+                    
+                    if update_success:
+                        updated_count += 1
+                        logging.info(f"Добавлена дата домена {domain} в botmonitor_sites")
+                    else:
+                        failed_count += 1
+                        logging.error(f"Ошибка добавления даты домена {domain}: {update_result}")
+                
+                # Проверяем, есть ли домен в WHOIS мониторинге
+                domain_exists_result = await safe_supabase_operation(
+                    lambda: supabase.table('botmonitor_domain_monitor').select('id').eq('domain_name', domain).execute(),
+                    operation_name=f"check_domain_exists_{domain}"
                 )
                 
-                if success:
-                    added_count += 1
-                    logging.info(f"Добавлен домен {domain} в WHOIS мониторинг")
-                else:
-                    failed_count += 1
-                    logging.error(f"Ошибка добавления домена {domain}: {result}")
+                if domain_exists_result[0] and not domain_exists_result[1].data:
+                    # Добавляем в WHOIS мониторинг, если там еще нет
+                    whois_success, whois_result = await safe_supabase_operation(
+                        lambda: supabase.table('botmonitor_domain_monitor').insert({
+                            'domain_name': domain,
+                            'current_expiry_date': expiry_date_str,
+                            'admin_chat_id': site['chat_id'],  # Используем тот же чат
+                            'project_chat_id': site['chat_id'],  # Используем тот же чат
+                            'is_reserve_domain': site.get('is_reserve_domain', False),  # Используем статус из основной таблицы
+                            'last_check_date': datetime.now(timezone.utc).isoformat()
+                        }).execute(),
+                        operation_name=f"auto_insert_domain_{domain}"
+                    )
+                    
+                    if whois_success:
+                        added_count += 1
+                        logging.info(f"Добавлен домен {domain} в WHOIS мониторинг")
+                    else:
+                        failed_count += 1
+                        logging.error(f"Ошибка добавления домена {domain} в WHOIS мониторинг: {whois_result}")
+                elif domain_exists_result[0] and domain_exists_result[1].data:
+                    # Обновляем дату в WHOIS мониторинге, если домен уже там
+                    whois_success, whois_result = await safe_supabase_operation(
+                        lambda: supabase.table('botmonitor_domain_monitor').update({
+                            'current_expiry_date': expiry_date_str,
+                            'last_check_date': datetime.now(timezone.utc).isoformat()
+                        }).eq('domain_name', domain).execute(),
+                        operation_name=f"update_domain_expiry_whois_{domain}"
+                    )
+                    
+                    if whois_success:
+                        logging.info(f"Обновлена дата домена {domain} в WHOIS мониторинге")
+                    else:
+                        failed_count += 1
+                        logging.error(f"Ошибка обновления даты домена {domain} в WHOIS мониторинге: {whois_result}")
                     
             except Exception as e:
                 failed_count += 1
                 logging.error(f"Ошибка при обработке домена {domain}: {e}")
         
-        response = f"🔄 **Результаты автоматического добавления:**\n\n"
-        response += f"✅ Успешно добавлено: {added_count}\n"
+        response = f"🔄 **Результаты проверки WHOIS для {len(sites)} доменов:**\n\n"
+        response += f"📅 Обновлено дат в основной таблице: {updated_count}\n"
+        response += f"➕ Добавлено в WHOIS мониторинг: {added_count}\n"
         response += f"❌ Ошибок: {failed_count}\n"
         
-        if added_count > 0:
-            response += "\nИспользуйте /whoislist для просмотра добавленных доменов"
+        if updated_count > 0 or added_count > 0:
+            response += "\nИспользуйте /whoislist для просмотра доменов в WHOIS мониторинге"
         
         await message.answer(response, parse_mode="Markdown")
 

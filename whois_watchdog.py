@@ -25,76 +25,116 @@ EXPIRATION_REMINDERS = [30, 7, 3, 1]  # Дни для напоминаний о�
 
 async def get_whois_expiry_date(domain: str) -> Optional[datetime]:
     """
-    Robust WHOIS lookup compatible with asyncwhois v1.1.12+
+    Robust WHOIS lookup with mandatory Punycode conversion for IDN domains.
     """
     try:
-        logging.info(f"Получение WHOIS данных для домена: {domain}")
-        
-        # 1. Clean Domain Extraction (removes http://, www., etc.)
+        # 1. Force Punycode Encoding (The Fix)
+        # This handles 'цифровизируем.рф' -> 'xn--b1agfcbb3akrf7aey.xn--p1ai'
+        try:
+            domain.encode('ascii')
+            # If no error, it's already ASCII/Punycode
+        except UnicodeEncodeError:
+            domain = domain.encode('idna').decode('ascii')
+            
+        logging.info(f"Получение WHOIS данных для домена (Punycode): {domain}")
+
+        # 2. Extract parts (using Punycode version)
         ext = tldextract.extract(domain)
+        # Reassemble to ensure clean structure (no http://, etc.)
         clean_domain = f"{ext.domain}.{ext.suffix}"
         
         if not ext.domain or not ext.suffix:
-             logging.warning(f"Некорректный домен: {domain}")
+             logging.warning(f"Некорректный домен после обработки: {domain}")
              return None
 
-        # 2. Async Lookup (FIXED API CALL)
-        # Using the correct asyncwhois v1.1.12+ API
+        # 3. Async Lookup
+        # Note: clean_domain is now guaranteed to be 'xn--...' for Cyrillic
         result = await asyncwhois.aio_whois(clean_domain)
         
-        # 3. Normalized Result Parsing
+        # 4. Result Parsing (Dict/Tuple/Object handling)
         whois_dict = {}
-        
-        # Case A: DomainLookup object with parser_output (Standard v1.1.12+)
         if hasattr(result, 'parser_output'):
             whois_dict = result.parser_output
-        # Case B: Dictionary (Direct return)
         elif isinstance(result, dict):
             whois_dict = result
-        # Case C: Tuple (Legacy/Specific calls)
         elif isinstance(result, tuple):
-             # Try to find the dict in the tuple
              for item in result:
                  if isinstance(item, dict):
                      whois_dict = item
                      break
-
-        if not whois_dict:
-            logging.warning(f"Пустой результат WHOIS для {clean_domain}")
-            return None
-
-        # 4. Date Extraction (Try multiple common keys)
-        expiry_keys = ['expires', 'expiration_date', 'registry_expiry_date', 'paid-till', 'free-date']
-        expiry_date = None
         
+        # 5. Date Search
+        expiry_keys = [
+            'expires', 'expiration_date', 'registry_expiry_date',
+            'paid-till', 'paid_till', 'expiration', 'expire', 'free-date'
+        ]
+        
+        expiry_date = None
         for key in expiry_keys:
             val = whois_dict.get(key)
             if val:
                 expiry_date = val
                 break
         
-        # 5. Date Normalization
+        # 6. Regex Fallback (Critical for .RU/.RF)
+        # Check if suffix is .ru, .su, .рф (xn--p1ai), .рус (xn--p1acf)
+        ru_suffixes = ['ru', 'su', 'xn--p1ai', 'xn--p1acf']
+        
+        if not expiry_date and ext.suffix in ru_suffixes:
+            raw_text = ""
+            if hasattr(result, 'query_output'):
+                 raw_text = result.query_output
+            elif isinstance(result, tuple) and len(result) > 0:
+                 # First element is usually the raw WHOIS text
+                 if isinstance(result[0], str):
+                     raw_text = result[0]
+                 # If first element is not text, check second element
+                 elif len(result) > 1 and isinstance(result[1], str):
+                     raw_text = result[1]
+                 # If second element is a dict, try to find a text field
+                 elif len(result) > 1 and isinstance(result[1], dict):
+                     for key in ['raw', 'text', 'raw_text']:
+                         if key in result[1] and isinstance(result[1][key], str):
+                             raw_text = result[1][key]
+                             break
+            
+            if raw_text:
+                # Regex for "paid-till: 2025.10.15" or "2025-10-15T..."
+                # Matches YYYY.MM.DD or YYYY-MM-DD
+                match = re.search(r'paid-till:\s*(\d{4}[./-]\d{2}[./-]\d{2})', raw_text, re.IGNORECASE)
+                if match:
+                    expiry_date = match.group(1).replace('.', '-')
+                    logging.info(f"Найдена дата через regex для {clean_domain}: {expiry_date}")
+
+        if not expiry_date:
+            logging.warning(f"Дата не найдена для {clean_domain}. Dict keys: {list(whois_dict.keys())}")
+            return None
+
+        # 7. Date Normalization
         if isinstance(expiry_date, list):
             expiry_date = expiry_date[0]
             
         if isinstance(expiry_date, str):
-            # Try parsing common string formats if raw string returned
+            # Clean string (remove time if T is present for simpler ISO parsing)
+            expiry_date = expiry_date.strip().split('T')[0]
             try:
-                # ISO format often works
                 expiry_date = datetime.fromisoformat(expiry_date)
-            except:
-                pass
+            except ValueError:
+                # Try specific RU format YYYY.MM.DD if ISO failed
+                 try:
+                     expiry_date = datetime.strptime(expiry_date, "%Y.%m.%d")
+                 except:
+                     pass
 
         if isinstance(expiry_date, datetime):
             if expiry_date.tzinfo is None:
                 expiry_date = expiry_date.replace(tzinfo=timezone.utc)
             return expiry_date
             
-        logging.warning(f"Дата истечения не найдена или формат не распознан для {clean_domain}: {expiry_date}")
         return None
 
     except Exception as e:
-        logging.error(f"WHOIS Critical Error for {domain}: {e}")
+        logging.error(f"WHOIS Error for {domain}: {e}")
         return None
 
 

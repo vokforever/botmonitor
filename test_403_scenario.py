@@ -10,6 +10,10 @@ import os
 import logging
 from datetime import datetime
 
+# Исправление для Windows Proactor event loop предупреждения
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 # Добавляем путь к основному файлу для импорта
 sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
 

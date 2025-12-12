@@ -8,6 +8,7 @@ import OpenSSL
 import os
 import time
 import re
+import sys
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from aiogram import Bot, Dispatcher, types, F
@@ -21,6 +22,14 @@ from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 from supabase import create_client, Client
 from urllib.parse import urlparse
+import whois_integration  # Импортируем модуль WHOIS интеграции
+from whois_watchdog import get_whois_expiry_date  # Импортируем функцию для получения WHOIS данных
+from utils import safe_supabase_operation, send_admin_notification  # Импортируем общие функции
+
+# Исправление для Windows Proactor event loop предупреждения
+if sys.platform == "win32":
+    asyncio.set_event_loop_policy(asyncio.WindowsSelectorEventLoopPolicy())
+
 try:
     from curl_cffi import requests as curl_requests
     CURL_CFFI_AVAILABLE = True
@@ -95,14 +104,6 @@ async def is_admin_in_chat(chat_id: int, user_id: int) -> bool:
 
 
 
-
-async def send_admin_notification(message: str):
-    """Отправляет уведомление администратору"""
-    try:
-        await bot.send_message(chat_id=ADMIN_CHAT_ID, text=message)
-        logging.info(f"Уведомление отправлено админу: {message}")
-    except Exception as e:
-        logging.error(f"Ошибка отправки уведомления админу: {e}")
 
 async def send_notification(chat_id: int, text: str):
     """
@@ -291,6 +292,60 @@ def process_url(url):
             return url
 
     return url
+
+def extract_domain_from_url(url):
+    """
+    Надежное извлечение домена из URL с использованием urlparse
+    
+    Args:
+        url: URL для извлечения домена
+        
+    Returns:
+        str: Домен в формате punycode (если применимо)
+    """
+    try:
+        # Проверяем, что url это строка
+        if not isinstance(url, str):
+            logging.error(f"URL не является строкой: {type(url)} - {url}")
+            return str(url) if url else ""
+            
+        # Убираем пробелы по краям
+        url = url.strip()
+        
+        # Убедимся, что URL имеет протокол
+        if not (url.startswith('http://') or url.startswith('https://')):
+            url = 'https://' + url
+            
+        # Используем urlparse для надежного извлечения домена
+        parsed = urlparse(url)
+        domain = parsed.netloc
+        
+        # Убираем userinfo если есть (user:pass@host)
+        if '@' in domain:
+            domain = domain.split('@')[1]
+            
+        # Убираем порт если есть
+        if ':' in domain:
+            domain = domain.split(':')[0]
+            
+        # Преобразуем в punycode если это IDN
+        try:
+            punycode_domain = idna.encode(domain).decode('ascii')
+            return punycode_domain
+        except:
+            # Если преобразование не удалось, возвращаем как есть
+            return domain
+    except Exception as e:
+        logging.error(f"Error extracting domain from URL {url}: {e}")
+        # В случае ошибки, используем старый метод как запасной
+        try:
+            if isinstance(url, str):
+                url = url.replace('https://', '').replace('http://', '')
+                return url.split('/')[0]
+            else:
+                return str(url) if url else ""
+        except:
+            return ""
 
 
 # Функция проверки SSL сертификата
@@ -498,7 +553,13 @@ async def cmd_start(message: Message):
         "/setdomain ID - установить дату истечения домена\n"
         "/sethosting ID - установить дату истечения хостинга\n"
         "/myid - показать ваш User ID и Chat ID\n"
-        "/help - показать справку\n"
+        "/help - показать справку\n\n"
+        "WHOIS команды:\n"
+        "/autowhois - запустить проверку WHOIS для всех доменов\n"
+        "/checkwhois домен - проверить WHOIS для конкретного домена\n"
+        "/whoislist - показать список доменов в WHOIS мониторинге\n"
+        "/adddomain - добавить домен в WHOIS мониторинг\n"
+        "/syncwhois - синхронизировать домены с WHOIS мониторингом\n"
     )
 
 
@@ -527,6 +588,13 @@ async def cmd_help(message: Message):
     help_text += "/sethosting [ID] - установить дату истечения хостинга\n"
     help_text += "/myid - показать ваш User ID и Chat ID\n"
     help_text += "/help - показать эту справку\n\n"
+    
+    help_text += "**WHOIS команды:**\n"
+    help_text += "/autowhois - запустить проверку WHOIS для всех доменов\n"
+    help_text += "/checkwhois домен - проверить WHOIS для конкретного домена\n"
+    help_text += "/whoislist - показать список доменов в WHOIS мониторинге\n"
+    help_text += "/adddomain - добавить домен в WHOIS мониторинг\n"
+    help_text += "/syncwhois - синхронизировать домены с WHOIS мониторингом\n\n"
     
     help_text += "**Что проверяет бот:**\n"
     help_text += "✅ **Доступность сайта** - уведомление если два раза подряд недоступен\n"
@@ -774,6 +842,43 @@ async def cmd_list(message: Message):
         await message.answer("📝 Список отслеживаемых сайтов пуст. Добавьте сайт командой /add")
         return
 
+    # Отправляем сообщение о начале проверки
+    status_msg = await message.answer("🔄 Проверяю WHOIS данные для доменов...")
+    
+    # Проверяем и обновляем WHOIS данные для сайтов без даты истечения домена
+    whois_updated_count = 0
+    for site in sites:
+        if not site.get('domain_expires_at'):
+            url = site['url']
+            original_url = site.get('original_url', url)
+            domain = extract_domain_from_url(original_url)
+            
+            try:
+                # Получаем дату истечения через WHOIS
+                expiry_date = await get_whois_expiry_date(domain)
+                
+                if expiry_date:
+                    # Обновляем дату в основной таблице
+                    update_success, _ = await safe_supabase_operation(
+                        lambda: supabase.table('botmonitor_sites').update({
+                            'domain_expires_at': expiry_date.date().isoformat()
+                        }).eq('id', site['id']).execute(),
+                        operation_name=f"update_domain_expiry_from_list_{site['id']}"
+                    )
+                    
+                    if update_success:
+                        whois_updated_count += 1
+                        # Обновляем данные в локальном массиве
+                        site['domain_expires_at'] = expiry_date.date().isoformat()
+                        logging.info(f"Обновлена дата домена {domain} из WHOIS")
+            except Exception as e:
+                logging.error(f"Ошибка при получении WHOIS для домена {domain}: {e}")
+    
+    if whois_updated_count > 0:
+        await status_msg.edit_text(f"🔄 Обновлено {whois_updated_count} дат доменов из WHOIS. Формирую список...")
+    else:
+        await status_msg.edit_text("🔄 Формирую список сайтов...")
+
     response = "📝 Список отслеживаемых сайтов:\n\n"
     for site in sites:
         site_id = site['id']
@@ -825,7 +930,7 @@ async def cmd_list(message: Message):
                 domain_status = f"Домен до {domain_date.strftime('%d.%m.%Y')}"
             site_info += f"Домен: {domain_status}\n"
         else:
-            site_info += "Домен: дата не установлена\n"
+            site_info += "Домен: дата не установлена (используйте /autowhois для обновления)\n"
 
         if hosting_expires_at:
             hosting_date = datetime.fromisoformat(hosting_expires_at).date()
@@ -842,6 +947,11 @@ async def cmd_list(message: Message):
 
         site_info += f"Последняя проверка: {last_check_str}\n\n"
         response += site_info
+
+    # Добавляем информацию об обновлении WHOIS если были изменения
+    if whois_updated_count > 0:
+        response += f"\n🔄 **Обновлено {whois_updated_count} дат доменов из WHOIS**\n"
+        response += "Используйте /autowhois для обновления всех доменов"
 
     await message.answer(response)
 
@@ -1886,14 +1996,13 @@ async def tcp_check(url):
     start_time = time.time()
     
     try:
-        # Извлекаем хост и порт из URL
-        parsed = urlparse(url)
-        host = parsed.netloc
-        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        # Используем нашу функцию для извлечения домена
+        domain = extract_domain_from_url(url)
         
-        # Убираем userinfo если есть (user:pass@host)
-        if '@' in host:
-            host = host.split('@')[1]
+        # Извлекаем порт из URL
+        parsed = urlparse(url)
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        host = domain
         
         logging.debug(f"TCP-проверка для {host}:{port}")
         
@@ -2287,67 +2396,6 @@ async def handle_show_reserve_domains_callback(callback: CallbackQuery):
         await callback.answer("Ошибка при получении резервных доменов.")
 
 
-# Вспомогательная функция для безопасного выполнения операций с Supabase
-async def safe_supabase_operation(operation_func, max_retries=3, retry_delay=5, operation_name="unknown"):
-    """
-    Безопасное выполнение операции с Supabase с повторными попытками
-    
-    Args:
-        operation_func: Функция, выполняющая операцию с Supabase
-        max_retries: Максимальное количество попыток
-        retry_delay: Задержка между попытками в секундах
-        operation_name: Название операции для логирования
-    
-    Returns:
-        tuple: (success, result_or_error)
-    """
-    start_time = datetime.now(timezone.utc)
-    
-    for attempt in range(max_retries):
-        try:
-            # Выполняем операцию в отдельном потоке, чтобы не блокировать основной цикл
-            result = await asyncio.to_thread(operation_func)
-            
-            # Логируем успешное выполнение
-            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-            logging.debug(f"Операция Supabase '{operation_name}' выполнена успешно за {duration:.3f} сек (попытка {attempt + 1})")
-            
-            return True, result
-        except Exception as e:
-            error_msg = str(e)
-            duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-            
-            # Определяем тип ошибки для лучшей диагностики
-            error_type = type(e).__name__
-            if "JSON could not be generated" in error_msg or "code 556" in error_msg:
-                error_type = "JSON_ERROR"
-                logging.error(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
-            elif "timeout" in error_msg.lower():
-                error_type = "TIMEOUT"
-                logging.warning(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
-            elif "connection" in error_msg.lower():
-                error_type = "CONNECTION"
-                logging.warning(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
-            else:
-                logging.error(f"[{error_type}] Операция '{operation_name}' (попытка {attempt + 1}/{max_retries}): {error_msg}")
-            
-            # Проверяем на специфические ошибки JSON
-            if "JSON could not be generated" in error_msg or "code 556" in error_msg:
-                logging.error(f"Обнаружена критическая ошибка JSON (код 556): {error_msg}")
-                if attempt < max_retries - 1:
-                    logging.info(f"Повторная попытка через {retry_delay} секунд...")
-                    await asyncio.sleep(retry_delay)
-                    continue
-            
-            # Другие ошибки
-            if attempt < max_retries - 1:
-                await asyncio.sleep(retry_delay)
-            else:
-                total_duration = (datetime.now(timezone.utc) - start_time).total_seconds()
-                logging.error(f"Операция '{operation_name}' не выполнена после {max_retries} попыток за {total_duration:.2f} сек")
-                return False, e
-    
-    return False, Exception("Превышено максимальное количество попыток")
 
 # Функция проверки доступности сайтов (каждые 5 минут)
 async def scheduled_availability_check():
@@ -2823,6 +2871,12 @@ async def main():
     
     # Запускаем задачу проверки сайтов при старте
     await on_startup()
+    
+    # Регистрируем обработчики WHOIS
+    whois_integration.register_whois_handlers(dp, supabase, bot)
+    
+    # Запускаем WHOIS Watchdog
+    await whois_integration.start_whois_watchdog(supabase, bot)
     
     # Запускаем бота через supervisor
     await supervisor()
