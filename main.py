@@ -6,6 +6,8 @@ import ssl
 import socket
 import OpenSSL
 import os
+import time
+import re
 from datetime import datetime, timedelta, timezone
 from dateutil.relativedelta import relativedelta
 from aiogram import Bot, Dispatcher, types, F
@@ -18,6 +20,13 @@ from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
 from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 from supabase import create_client, Client
+from urllib.parse import urlparse
+try:
+    from curl_cffi import requests as curl_requests
+    CURL_CFFI_AVAILABLE = True
+except ImportError:
+    logging.warning("curl_cffi не установлен, будет использоваться aiohttp")
+    CURL_CFFI_AVAILABLE = False
 
 # Загружаем переменные окружения из .env файла
 load_dotenv()
@@ -1714,6 +1723,7 @@ async def check_site_alternative(url):
 async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_interval=DOWN_CHECK_INTERVAL):
     """
     Улучшенная функция проверки доступности сайта с несколькими попытками.
+    Использует "Layered Health Check" для борьбы с ложными отключениями.
     
     Args:
         url: URL сайта для проверки
@@ -1730,20 +1740,23 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
     last_response_time = 0.0
     last_page_title = None
     last_final_url = url
+    last_check_type = None
     
     logging.debug(f"Начинаю проверку сайта {url} (макс. попыток: {max_attempts}, интервал: {retry_interval} сек)")
     
     while attempts < max_attempts:
         attempts += 1
-        is_available, status_code, response_time, page_title, final_url = await check_site(url)
+        is_available, status_code, response_time, page_title, final_url, check_type = await check_site_availability(url)
         last_status_code = status_code
         last_response_time = response_time
         last_page_title = page_title
         last_final_url = final_url
+        last_check_type = check_type
         
-        # Если сайт доступен, возвращаем результат сразу
+        # Если сайт доступен (включая TCP-доступность при 403/401), возвращаем результат сразу
         if is_available:
-            logging.info(f"Сайт {url} доступен с попытки {attempts} (статус: {status_code}, время: {response_time:.2f}s)")
+            check_info = f" (тип проверки: {last_check_type})" if last_check_type != "http" else ""
+            logging.info(f"Сайт {url} доступен с попытки {attempts} (статус: {status_code}, время: {response_time:.2f}s){check_info}")
             return True, status_code, attempts, response_time, page_title, final_url
         
         # Проверяем тип ошибки
@@ -1783,6 +1796,210 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
     # Если все попытки неудачны
     logging.warning(f"Сайт {url} недоступен после {attempts} попыток (последний статус: {last_status_code}, DNS-ошибок: {dns_errors_count}, время ответа: {last_response_time:.2f}с)")
     return False, last_status_code, attempts, last_response_time, last_page_title, last_final_url
+
+
+async def check_site_availability(url):
+    """
+    Реализация "Layered Health Check" с использованием curl_cffi для борьбы с ложными отключениями.
+    
+    Шаг 1: HTTP-проверка через curl_cffi с имперсонацией браузера (30 секунд)
+    Шаг 2: TCP-проверка при 403/401 или таймауте (5 секунд)
+    Шаг 3: Решение о статусе сайта
+    
+    Returns:
+        tuple: (is_available, status_code, response_time, page_title, final_url, check_type)
+                check_type: "http", "tcp_only", "down"
+    """
+    start_time = time.time()
+    
+    # Шаг 1: HTTP-проверка через curl_cffi
+    try:
+        if CURL_CFFI_AVAILABLE:
+            # Используем curl_cffi с имперсонацией Chrome 120
+            async with curl_requests.AsyncSession(impersonate="chrome120") as session:
+                response = await session.get(url, timeout=30)
+                response_time = time.time() - start_time
+                
+                # Получаем финальный URL после редиректов
+                final_url = response.url
+                
+                # Получаем заголовок страницы
+                page_title = None
+                if response.status_code < 400:
+                    try:
+                        html_content = response.text
+                        title_match = re.search(r'<title[^>]*>([^<]+)</title>', html_content, re.IGNORECASE)
+                        if title_match:
+                            page_title = title_match.group(1).strip()
+                    except Exception as title_error:
+                        logging.debug(f"Не удалось извлечь заголовок для {url}: {title_error}")
+                
+                # Если статус 200-299, сайт доступен
+                if 200 <= response.status_code < 300:
+                    logging.info(f"Сайт {url} доступен через HTTP (статус: {response.status_code}, время: {response_time:.2f}s)")
+                    return True, response.status_code, response_time, page_title, final_url, "http"
+                
+                # Если статус 403/401, пробуем TCP-проверку (сайт блокирует бота, но жив)
+                elif response.status_code in [403, 401]:
+                    logging.warning(f"Получен {response.status_code} для {url}, attempting TCP check...")
+                    tcp_result = await tcp_check(url)
+                    if tcp_result[0]:  # TCP успешен
+                        logging.info(f"Сайт {url} доступен через TCP (заблокирован HTTP, но жив)")
+                        return True, response.status_code, response_time, page_title, final_url, "tcp_only"
+                    else:
+                        logging.warning(f"Сайт {url} недоступен и по HTTP, и по TCP")
+                        return False, response.status_code, response_time, page_title, final_url, "down"
+                
+                # Другие ошибки HTTP (4xx, 5xx)
+                else:
+                    logging.warning(f"Сайт {url} вернул ошибку HTTP {response.status_code}")
+                    return False, response.status_code, response_time, page_title, final_url, "http"
+        else:
+            # Fallback к aiohttp если curl_cffi недоступен
+            return await check_site_fallback_aiohttp(url, start_time)
+            
+    except Exception as e:
+        total_time = time.time() - start_time
+        logging.warning(f"HTTP-проверка не удалась для {url}: {e} (время: {total_time:.2f}s)")
+        
+        # При любой ошибке пробуем TCP-проверку
+        tcp_result = await tcp_check(url)
+        if tcp_result[0]:  # TCP успешен
+            logging.info(f"Сайт {url} доступен через TCP (HTTP ошибка: {e})")
+            return True, 0, total_time, None, url, "tcp_only"
+        else:
+            logging.warning(f"Сайт {url} недоступен и по HTTP, и по TCP")
+            return False, 0, total_time, None, url, "down"
+
+
+async def tcp_check(url):
+    """
+    TCP-проверка доступности сайта (Layered Health Check - Шаг 2).
+    Проверяет, что хост отвечает на TCP-соединение, даже если HTTP заблокирован.
+    
+    Args:
+        url: URL сайта для проверки
+        
+    Returns:
+        tuple: (is_available, response_time)
+    """
+    start_time = time.time()
+    
+    try:
+        # Извлекаем хост и порт из URL
+        parsed = urlparse(url)
+        host = parsed.netloc
+        port = parsed.port or (443 if parsed.scheme == 'https' else 80)
+        
+        # Убираем userinfo если есть (user:pass@host)
+        if '@' in host:
+            host = host.split('@')[1]
+        
+        logging.debug(f"TCP-проверка для {host}:{port}")
+        
+        # Создаем TCP соединение с таймаутом 5 секунд
+        with socket.create_connection((host, port), timeout=5) as sock:
+            response_time = time.time() - start_time
+            logging.debug(f"TCP-соединение успешно для {host}:{port} (время: {response_time:.3f}s)")
+            return True, response_time
+            
+    except socket.timeout:
+        response_time = time.time() - start_time
+        logging.warning(f"TCP-таймаут для {url} (время: {response_time:.3f}s)")
+        return False, response_time
+    except socket.gaierror as e:
+        response_time = time.time() - start_time
+        logging.warning(f"DNS-ошибка при TCP-проверке {url}: {e} (время: {response_time:.3f}s)")
+        return False, response_time
+    except Exception as e:
+        response_time = time.time() - start_time
+        logging.warning(f"TCP-проверка не удалась для {url}: {e} (время: {response_time:.3f}s)")
+        return False, response_time
+
+
+async def check_site_fallback_aiohttp(url, start_time):
+    """
+    Fallback-функция проверки сайта через aiohttp, если curl_cffi недоступен.
+    Реализует ту же логику "Layered Health Check", что и основная функция.
+    
+    Args:
+        url: URL сайта для проверки
+        start_time: Время начала проверки
+        
+    Returns:
+        tuple: (is_available, status_code, response_time, page_title, final_url, check_type)
+    """
+    try:
+        # Настраиваем ClientSession с User-Agent Chrome 120 для максимальной совместимости
+        headers = {
+            'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36'
+        }
+        
+        logging.debug(f"Используем aiohttp fallback для {url}")
+        
+        # Устанавливаем жесткий таймаут в 30 секунд для всех сетевых операций
+        timeout = aiohttp.ClientTimeout(total=30, connect=10)
+        async with aiohttp.ClientSession(headers=headers, timeout=timeout) as session:
+            # allow_redirects=True по умолчанию, max_redirects=10 по умолчанию
+            # Устанавливаем max_redirects=7 как у конкурента
+            async with session.get(url, allow_redirects=True, max_redirects=7) as response:
+                # Замеряем время ответа
+                response_time = time.time() - start_time
+                
+                # Получаем финальный URL после редиректов
+                final_url = str(response.url)
+                
+                logging.debug(f"Ответ от {url}: статус={response.status}, время={response_time:.2f}с, финальный_url={final_url}")
+                
+                # Получаем заголовок страницы с таймаутом
+                page_title = None
+                if response.status < 400:
+                    try:
+                        # Устанавливаем таймаут на чтение контента
+                        html_content = await asyncio.wait_for(response.text(), timeout=10)
+                        # Простой парсинг заголовка из HTML
+                        title_match = re.search(r'<title[^>]*>([^<]+)</title>', html_content, re.IGNORECASE)
+                        if title_match:
+                            page_title = title_match.group(1).strip()
+                        logging.debug(f"Заголовок страницы {url}: {page_title}")
+                    except asyncio.TimeoutError:
+                        logging.warning(f"Таймаут при получении контента для {url}")
+                    except Exception as title_error:
+                        logging.debug(f"Не удалось извлечь заголовок для {url}: {title_error}")
+                
+                # Если статус 200-299, сайт доступен
+                if 200 <= response.status < 300:
+                    logging.info(f"Сайт {url} доступен через aiohttp (статус: {response.status}, время: {response_time:.2f}s)")
+                    return True, response.status, response_time, page_title, final_url, "http"
+                
+                # Если статус 403/401, пробуем TCP-проверку (сайт блокирует бота, но жив)
+                elif response.status in [403, 401]:
+                    logging.warning(f"Получен {response.status} для {url}, attempting TCP check...")
+                    tcp_result = await tcp_check(url)
+                    if tcp_result[0]:  # TCP успешен
+                        logging.info(f"Сайт {url} доступен через TCP (заблокирован HTTP, но жив)")
+                        return True, response.status, response_time, page_title, final_url, "tcp_only"
+                    else:
+                        logging.warning(f"Сайт {url} недоступен и по HTTP, и по TCP")
+                        return False, response.status, response_time, page_title, final_url, "down"
+                
+                # Другие ошибки HTTP (4xx, 5xx)
+                else:
+                    logging.warning(f"Сайт {url} вернул ошибку HTTP {response.status}")
+                    return False, response.status, response_time, page_title, final_url, "http"
+                
+    except Exception as e:
+        total_time = time.time() - start_time
+        logging.warning(f"aiohttp fallback не удался для {url}: {e} (время: {total_time:.2f}s)")
+        
+        # При любой ошибке пробуем TCP-проверку
+        tcp_result = await tcp_check(url)
+        if tcp_result[0]:  # TCP успешен
+            logging.info(f"Сайт {url} доступен через TCP (aiohttp ошибка: {e})")
+            return True, 0, total_time, None, url, "tcp_only"
+        else:
+            logging.warning(f"Сайт {url} недоступен и по aiohttp, и по TCP")
+            return False, 0, total_time, None, url, "down"
 
 
 # --- НОВЫЙ БЛОК: Данные для массового импорта ---
