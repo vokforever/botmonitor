@@ -15,6 +15,8 @@ from aiogram.fsm.state import State, StatesGroup
 from aiogram.filters.command import Command
 from aiogram.types import Message, InlineKeyboardButton, InlineKeyboardMarkup, CallbackQuery
 from aiogram.exceptions import TelegramNetworkError, TelegramRetryAfter
+from aiogram.client.session.aiohttp import AiohttpSession
+from aiohttp import ClientTimeout
 from dotenv import load_dotenv
 from supabase import create_client, Client
 
@@ -49,9 +51,10 @@ SCREENSHOTMACHINE_API_KEY = os.getenv('SCREENSHOTMACHINE_API_KEY')
 supabase: Client = create_client(SUPABASE_URL, SUPABASE_KEY)
 
 from io import BytesIO
-import requests
 
-bot = Bot(token=API_TOKEN)
+# Создаем устойчивую сессию с настройками таймаута
+session = AiohttpSession(timeout=ClientTimeout(total=60, connect=15))
+bot = Bot(token=API_TOKEN, session=session)
 storage = MemoryStorage()
 dp = Dispatcher(storage=storage)
 
@@ -349,20 +352,25 @@ async def take_screenshot(url: str) -> BytesIO:
             'thumbnail': 'false'
         }
         
-        # Отправляем запрос к API
-        response = requests.get('https://api.screenshotmachine.com', params=params, timeout=35)
+        # Настраиваем таймаут для aiohttp
+        timeout = aiohttp.ClientTimeout(total=35)
         
-        if response.status_code == 200:
-            logging.info(f"Screenshot created successfully via API for {url}")
-            return BytesIO(response.content)
-        else:
-            logging.error(f"ScreenshotMachine API error: {response.status_code} - {response.text}")
-            return None
+        # Отправляем запрос к API с использованием aiohttp
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get('https://api.screenshotmachine.com', params=params) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    logging.info(f"Screenshot created successfully via API for {url}")
+                    return BytesIO(content)
+                else:
+                    error_text = await response.text()
+                    logging.error(f"ScreenshotMachine API error: {response.status} - {error_text}")
+                    return None
             
-    except requests.exceptions.Timeout:
+    except asyncio.TimeoutError:
         logging.error(f"Timeout while creating screenshot via API for {url}")
         return None
-    except requests.exceptions.RequestException as e:
+    except aiohttp.ClientError as e:
         logging.error(f"Request error while creating screenshot via API for {url}: {e}")
         return None
     except Exception as e:
@@ -390,16 +398,28 @@ async def diagnose_api():
             'timeout': 10
         }
         
-        response = requests.get('https://api.screenshotmachine.com', params=params, timeout=15)
+        # Настраиваем таймаут для aiohttp
+        timeout = aiohttp.ClientTimeout(total=15)
         
-        if response.status_code == 200:
-            logging.info("ScreenshotMachine API is working correctly")
-            logging.info(f"API response size: {len(response.content)} bytes")
-            return True
-        else:
-            logging.error(f"ScreenshotMachine API error: {response.status_code} - {response.text}")
-            return False
+        # Отправляем запрос с использованием aiohttp
+        async with aiohttp.ClientSession(timeout=timeout) as session:
+            async with session.get('https://api.screenshotmachine.com', params=params) as response:
+                if response.status == 200:
+                    content = await response.read()
+                    logging.info("ScreenshotMachine API is working correctly")
+                    logging.info(f"API response size: {len(content)} bytes")
+                    return True
+                else:
+                    error_text = await response.text()
+                    logging.error(f"ScreenshotMachine API error: {response.status} - {error_text}")
+                    return False
             
+    except asyncio.TimeoutError:
+        logging.error("Timeout during ScreenshotMachine API diagnosis")
+        return False
+    except aiohttp.ClientError as e:
+        logging.error(f"Request error during ScreenshotMachine API diagnosis: {e}")
+        return False
     except Exception as e:
         logging.error(f"ScreenshotMachine API diagnosis failed: {e}")
         return False
@@ -1580,7 +1600,6 @@ async def check_site(url):
 
 async def check_site_alternative(url):
     """Альтернативная функция проверки через другой метод (для подтверждения)"""
-    import subprocess
     import re
     
     try:
@@ -1592,17 +1611,32 @@ async def check_site_alternative(url):
         # Пробуем ping (только для подтверждения DNS-резолвинга)
         try:
             # Используем ping с таймаутом 5 секунд и 1 пакетом
-            result = subprocess.run(['ping', '-c', '1', '-W', '5', domain],
-                                  capture_output=True, text=True, timeout=10)
+            # Для Windows используем -n вместо -c и -w вместо -W
+            import platform
+            is_windows = platform.system().lower() == 'windows'
             
-            if result.returncode == 0:
+            if is_windows:
+                ping_cmd = ['ping', '-n', '1', '-w', '5000', domain]
+            else:
+                ping_cmd = ['ping', '-c', '1', '-W', '5', domain]
+            
+            # Используем asyncio.create_subprocess_exec для неблокирующего выполнения
+            proc = await asyncio.create_subprocess_exec(
+                *ping_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            
+            if proc.returncode == 0:
                 # Ping прошел успешно, значит DNS работает
                 logging.info(f"Альтернативная проверка {url}: ping успешен")
                 return True, "ping_success"
             else:
                 logging.warning(f"Альтернативная проверка {url}: ping неуспешен")
                 return False, "ping_failed"
-        except subprocess.TimeoutExpired:
+        except asyncio.TimeoutError:
             logging.warning(f"Альтернативная проверка {url}: ping таймаут")
             return False, "ping_timeout"
         except Exception as e:
@@ -1610,15 +1644,28 @@ async def check_site_alternative(url):
             
         # Если ping не сработал, пробуем nslookup
         try:
-            result = subprocess.run(['nslookup', domain],
-                                  capture_output=True, text=True, timeout=10)
+            # Для Windows используем nslookup, для Linux - dig или nslookup
+            nslookup_cmd = ['nslookup', domain]
             
-            if result.returncode == 0 and "Address:" in result.stdout:
+            # Используем asyncio.create_subprocess_exec для неблокирующего выполнения
+            proc = await asyncio.create_subprocess_exec(
+                *nslookup_cmd,
+                stdout=asyncio.subprocess.PIPE,
+                stderr=asyncio.subprocess.PIPE
+            )
+            
+            stdout, stderr = await asyncio.wait_for(proc.communicate(), timeout=10)
+            stdout_text = stdout.decode('utf-8', errors='ignore')
+            
+            if proc.returncode == 0 and ("Address:" in stdout_text or "address:" in stdout_text):
                 logging.info(f"Альтернативная проверка {url}: DNS резолвинг успешен")
                 return True, "dns_success"
             else:
                 logging.warning(f"Альтернативная проверка {url}: DNS резолвинг неуспешен")
                 return False, "dns_failed"
+        except asyncio.TimeoutError:
+            logging.warning(f"Альтернативная проверка {url}: nslookup таймаут")
+            return False, "dns_timeout"
         except Exception as e:
             logging.warning(f"Альтернативная проверка {url}: ошибка nslookup - {e}")
             return False, "dns_error"
@@ -1642,6 +1689,7 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
     attempts = 0
     last_status_code = 0
     dns_errors_count = 0
+    network_unreachable_count = 0
     last_response_time = 0.0
     last_page_title = None
     last_final_url = url
@@ -1663,6 +1711,16 @@ async def check_site_with_retries(url, max_attempts=DOWN_CHECK_ATTEMPTS, retry_i
         if status_code == 0:
             # Это ошибка подключения/DNS
             dns_errors_count += 1
+            
+            # Проверяем на ошибку "Network is unreachable" [Errno 101]
+            if "Network is unreachable" in str(page_title) or "[Errno 101]" in str(page_title):
+                network_unreachable_count += 1
+                logging.warning(f"Обнаружена ошибка 'Network is unreachable' для {url} (попытка {attempts})")
+                
+                # Если это повторная ошибка сети, прекращаем попытки
+                if network_unreachable_count >= 2:
+                    logging.error(f"Сеть недоступна для {url}, прекращаем попытки проверки")
+                    return False, -101, attempts, 0.0, "Network is unreachable", url
             
             # Если это DNS-ошибка и у нас еще есть попытки, делаем дополнительную проверку
             if dns_errors_count >= 2 and attempts < max_attempts and ENABLE_ALTERNATIVE_CHECK:
@@ -1983,7 +2041,8 @@ async def safe_supabase_operation(operation_func, max_retries=3, retry_delay=5):
     """
     for attempt in range(max_retries):
         try:
-            result = operation_func()
+            # Выполняем операцию в отдельном потоке, чтобы не блокировать основной цикл
+            result = await asyncio.to_thread(operation_func)
             return True, result
         except Exception as e:
             error_msg = str(e)
@@ -2311,6 +2370,26 @@ async def on_startup():
     asyncio.create_task(scheduled_notification_check())
 
 
+async def supervisor():
+    """
+    Supervisor паттерн для обработки сетевых ошибок и перезапуска бота
+    """
+    while True:
+        try:
+            logging.info("Запуск бота с supervisor паттерном...")
+            await dp.start_polling(bot)
+        except (TelegramNetworkError, ConnectionError, TimeoutError) as e:
+            logging.error(f"Сетевая ошибка в боте: {e}")
+            await send_admin_notification(f"⚠️ Сетевая ошибка в боте, перезапуск через 5 секунд: {e}")
+            await asyncio.sleep(5)
+        except Exception as e:
+            logging.error(f"Критическая ошибка в боте: {e}")
+            import traceback
+            logging.error(f"Traceback: {traceback.format_exc()}")
+            await send_admin_notification(f"🚨 Критическая ошибка в боте, перезапуск через 10 секунд: {e}")
+            await asyncio.sleep(10)
+
+
 async def main():
     init_db()
     
@@ -2331,8 +2410,9 @@ async def main():
     
     # Запускаем задачу проверки сайтов при старте
     await on_startup()
-    # Запуск бота
-    await dp.start_polling(bot)
+    
+    # Запускаем бота через supervisor
+    await supervisor()
 
 
 if __name__ == '__main__':
