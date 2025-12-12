@@ -1,0 +1,10 @@
+{
+  "git.ignoreLimitWarning": true,
+  "files.exclude": {
+    "**/.env": true,
+    "**/.env.local": true,
+    "**/.env.production": true
+  },
+  "git.autofetch": false,
+  "extensions.ignoreRecommendations": true
+}
