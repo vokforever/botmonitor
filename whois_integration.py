@@ -561,6 +561,3 @@ async def start_whois_watchdog(supabase: Client, bot: Bot):
     
     # Запускаем планировщик ежедневных проверок
     asyncio.create_task(schedule_daily_whois_check(supabase, bot))
-    
-    # Отправляем уведомление о запуске
-    await send_admin_notification("🕵️ WHOIS Watchdog запущен и готов к работе!")

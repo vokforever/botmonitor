@@ -2569,10 +2569,18 @@ async def handle_show_reserve_domains_callback(callback: CallbackQuery):
 
 # Функция проверки доступности сайтов (каждые 5 минут)
 async def scheduled_availability_check():
-    await bot.send_message(ADMIN_CHAT_ID, "🚀 Бот мониторинга запущен (режим отказоустойчивости)")
+    # Добавляем флаг, чтобы избежать дублирования запусков
+    is_running = False
     
     while True:
         try:
+            if is_running:
+                logging.warning("Проверка сайтов уже запущена, пропускаем итерацию")
+                await asyncio.sleep(60)
+                continue
+                
+            is_running = True
+            
             # 1. Получаем сайты из БД
             success, sites_result = await safe_supabase_operation(
                 lambda: supabase.table('botmonitor_sites').select(
@@ -2585,12 +2593,14 @@ async def scheduled_availability_check():
                 logging.error(f"Не удалось получить список сайтов: {sites_result}")
                 await send_admin_notification(f"🔥 Критическая ошибка: не удалось получить список сайтов: {sites_result}")
                 await asyncio.sleep(60)  # Пауза перед перезапуском цикла
+                is_running = False
                 continue
             
             sites = sites_result.data
             if not sites:
                 logging.info("Список сайтов пуст, пропускаем проверку")
                 await asyncio.sleep(CHECK_INTERVAL)
+                is_running = False
                 continue
 
             start_time = datetime.now(timezone.utc)
@@ -2627,6 +2637,8 @@ async def scheduled_availability_check():
                 pass # Если даже Telegram недоступен, просто пишем в лог
             
             await asyncio.sleep(60) # Даем время "остыть" перед перезапуском
+        finally:
+            is_running = False
 
         # Используем рандомизированный интервал 5-10 минут как у конкурента
         import random
@@ -2978,12 +2990,25 @@ async def supervisor():
     """
     Улучшенный supervisor паттерн для обработки сетевых ошибок и перезапуска бота
     """
+    from aiogram.exceptions import TelegramConflictError
+    
     restart_count = 0
     while True:
         try:
             start_time = datetime.now(timezone.utc)
             logging.info(f"Запуск бота с улучшенным supervisor паттерном... (перезапуск #{restart_count}, время: {start_time.strftime('%H:%M:%S')})")
             await dp.start_polling(bot)
+        except TelegramConflictError as e:
+            # Особая обработка для конфликта экземпляров бота
+            restart_count += 1
+            error_msg = f"⚠️ Конфликт экземпляров бота: {e}"
+            logging.error(error_msg)
+            try:
+                await send_admin_notification(f"{error_msg}\nПроверьте, что нет других запущенных экземпляров бота. Перезапуск через 30 секунд (перезапуск #{restart_count})")
+            except Exception as notify_error:
+                logging.error(f"Не удалось отправить уведомление о конфликте: {notify_error}")
+            logging.info(f"Пауза 30 секунд перед перезапуском (конфликт экземпляров)...")
+            await asyncio.sleep(30)
         except (TelegramNetworkError, ConnectionError, TimeoutError) as e:
             restart_count += 1
             error_type = type(e).__name__
@@ -3023,13 +3048,25 @@ async def main():
     from datetime import timedelta
     moscow_time = datetime.now(timezone.utc) + timedelta(hours=3)
     
-    # Отправляем уведомление админу о запуске
+    # Запускаем задачу проверки сайтов при старте (без отправки сообщения)
+    await on_startup()
+    
+    # Регистрируем обработчики WHOIS
+    whois_integration.register_whois_handlers(dp, supabase, bot)
+    
+    # Запускаем WHOIS Watchdog (без отправки сообщения)
+    await whois_integration.start_whois_watchdog(supabase, bot)
+    
+    # Отправляем одно объединенное уведомление админу о запуске всех компонентов
     cache_info = f"🔄 Кэш резервных доменов: {len(RESERVE_DOMAINS_CACHE)} доменов"
     startup_message = "🚀 Бот мониторинга сайтов запущен!\n" \
                      f"⏰ Время запуска: {moscow_time.strftime('%Y-%m-%d %H:%M:%S')}\n" \
                      f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут\n" \
                      f"📊 Сайтов в базе проверки: {sites_count}\n" \
-                     f"{cache_info}"
+                     f"{cache_info}\n\n" \
+                     f"🕵️ WHOIS Watchdog запущен и готов к работе!\n" \
+                     f"🚀 Бот мониторинга запущен (режим отказоустойчивости)"
+    
     await send_admin_notification(startup_message)
     
     # Также выводим в лог
@@ -3038,15 +3075,8 @@ async def main():
     logging.info(f"🔄 Интервал проверки: {CHECK_INTERVAL // 60} минут")
     logging.info(f"📊 Сайтов в базе проверки: {sites_count}")
     logging.info(f"🔄 Кэш резервных доменов загружен: {len(RESERVE_DOMAINS_CACHE)} доменов")
-    
-    # Запускаем задачу проверки сайтов при старте
-    await on_startup()
-    
-    # Регистрируем обработчики WHOIS
-    whois_integration.register_whois_handlers(dp, supabase, bot)
-    
-    # Запускаем WHOIS Watchdog
-    await whois_integration.start_whois_watchdog(supabase, bot)
+    logging.info("🕵️ WHOIS Watchdog запущен и готов к работе!")
+    logging.info("🚀 Бот мониторинга запущен (режим отказоустойчивости)")
     
     # Запускаем бота через supervisor
     await supervisor()

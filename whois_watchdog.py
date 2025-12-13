@@ -490,22 +490,31 @@ async def schedule_daily_whois_check(supabase: Client, bot: Bot) -> None:
         supabase: Клиент Supabase
         bot: Экземпляр бота aiogram
     """
+    # Добавляем флаг, чтобы избежать дублирования запусков
+    is_running = False
+    last_check_date = None
+    
     while True:
         try:
             # Получаем текущее время
             now = datetime.now(timezone.utc)
+            current_date = now.date()
             
             # Проверяем, наступило ли время для проверки
-            if now.hour == WHOIS_CHECK_HOUR and now.minute < 5:
+            if now.hour == WHOIS_CHECK_HOUR and now.minute < 5 and not is_running and last_check_date != current_date:
+                is_running = True
                 logging.info("Запуск плановой проверки WHOIS доменов")
                 await check_domains_routine(supabase, bot)
+                last_check_date = current_date
                 
                 # Ждем до следующего дня
                 await asyncio.sleep(3600)  # Ждем час, чтобы не запустить проверку повторно
+                is_running = False
                 
             # Проверяем каждые 5 минут
             await asyncio.sleep(300)
             
         except Exception as e:
             logging.error(f"Ошибка в планировщике WHOIS: {e}")
+            is_running = False  # Сбрасываем флаг в случае ошибки
             await asyncio.sleep(300)  # В случае ошибки ждем 5 минут и пробуем снова
